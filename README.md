@@ -100,6 +100,16 @@ Per WanGP install, in `<WanGP folder>\launcher\`:
 Install log (setup mode): `%APPDATA%\WanGP Launcher\logs\install.log`.
 Start with Windows: `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, value `WanGPTray`.
 
+## Directing WanGP with Claude Code
+
+[`docs/WANGP_H3_ART_DIRECTION_HANDOFF.md`](docs/WANGP_H3_ART_DIRECTION_HANDOFF.md) is a handoff for an AI coding agent
+such as Claude Code acting as an art director for MiniMax H3 video in WanGP. It covers story structure, continuity and
+drift control, staging, camera, light, voice and sound direction, the H3 prompt formats, and WanGP's
+paragraph-per-window (PW) prompts for longer videos.
+
+To use it, give the agent the file and tell it where WanGP's MCP server is (for example `http://<this-pc>:7861/mcp`).
+The agent discovers WanGP's tools from there, and the launcher starts WanGP on the first tool call.
+
 ## Other tools
 
 While WanGP is working, the launcher sets the named event `Local\WanGP.Busy.Tray`. Another tray app (for example a local

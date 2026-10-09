@@ -40,6 +40,11 @@ window you can open from the tray.
 
 The launcher never installs Git, uv or Python itself.
 
+## Download
+
+Get `WanGP-Launcher.exe` from the [latest release](https://github.com/BrentCrude79/WanGP-Launcher/releases/latest), put it anywhere and run it.
+It is a single self-contained file. It is not code-signed, so SmartScreen may ask you to confirm on first run.
+
 ## Build
 
 No SDK or Visual Studio is needed. The script uses the C# compiler that ships with .NET Framework:

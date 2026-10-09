@@ -104,3 +104,7 @@ LLM launcher) can watch it to unload its own model and free VRAM for WanGP.
 
 - `--show-log` opens the log window on start.
 - Any other arguments are appended to the Python launch arguments.
+
+## License
+
+[GPL-3.0](LICENSE). Copyright (C) 2026 BrentCrude79.

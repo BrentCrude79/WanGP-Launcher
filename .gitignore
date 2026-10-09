@@ -1,0 +1,6 @@
+*.exe
+*.old.exe
+logs/
+*.flag
+mcp-cache.json
+launcher-args.txt

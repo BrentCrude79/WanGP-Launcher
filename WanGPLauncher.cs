@@ -1054,14 +1054,21 @@ namespace WanGPLauncher
             log.Commit(on ? "[update] Keep WanGP updated: on. The tray checks GitHub every " + UpdateCheckEveryMs / 3600000 +
                 " hours and installs updates while WanGP is not in use; it never stops a generation."
                 : "[update] Keep WanGP updated: off.");
+            if (!on && updateReady && !updatePartial && !manualUpdate)
+            {
+                updateReady = false;
+                updateRetryAt = 0;
+                log.Commit("[update] The postponed automatic update was cancelled.");
+            }
             if (on && !updateReady && !updatePartial) CheckForUpdate();
         }
 
         void UpdateNow()
         {
-            if (updatePartial && !updating && !updateReady && updateRetryAt <= Now)
+            if (updatePartial && !updating)
             {
                 updateReady = true;
+                updateRetryAt = 0;
                 log.Commit("[update] Retrying completion of the saved partial update; no fetch is needed.");
                 MaybeUpdate();
                 return;
@@ -1185,7 +1192,7 @@ namespace WanGPLauncher
                 {
                     error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
                     partialAbandoned = true;
-                    LogPartialRepair(localFiles, null, pinnedSha, "saved update state is incomplete");
+                    LogPartialRepair(files, localFiles, null, pinnedSha, "saved update state is incomplete");
                 }
                 else if (!resumePartial)
                 {
@@ -1206,7 +1213,7 @@ namespace WanGPLauncher
                     {
                         partialAbandoned = true;
                         error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
-                        LogPartialRepair(localFiles, null, pinnedSha, headError == null ? "HEAD changed since the partial update" : headError);
+                        LogPartialRepair(files, localFiles, null, pinnedSha, headError == null ? "HEAD changed since the partial update" : headError);
                     }
                     string inUseError = null;
                     List<string> inUse = partialAbandoned ? new List<string>() : FindInUseFiles(files, out inUseError);
@@ -1275,7 +1282,8 @@ namespace WanGPLauncher
                                 }
                             }
                             else if (ReadHead(out currentHead, out headError) &&
-                                ((currentHead == oldFullHead && SnapshotChanged(files, before)) || currentHead == pinnedSha))
+                                ((currentHead == oldFullHead && SnapshotChanged(files, before)) || currentHead == pinnedSha) &&
+                                RunTool("git", "merge-base --is-ancestor " + QuoteArgument(oldFullHead) + " " + QuoteArgument(pinnedSha), false, out output) == 0)
                             {
                                 partial = true;
                                 log.Commit("[update] git stopped partway through and left WanGP half-updated; completing the update.");
@@ -1322,7 +1330,7 @@ namespace WanGPLauncher
                             }
                             else if (currentHead != oldFullHead && currentHead != pinnedSha)
                             {
-                                LogPartialRepair(localFiles, null, pinnedSha, "HEAD changed while the update was running");
+                                LogPartialRepair(files, localFiles, null, pinnedSha, "HEAD changed while the update was running");
                                 error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
                                 partialAbandoned = true;
                             }
@@ -1477,7 +1485,11 @@ namespace WanGPLauncher
                 updateReady = true;
                 if (saved.RetryAtUtcTicks > 0)
                 {
-                    long remaining = Math.Max(0, (new DateTime(saved.RetryAtUtcTicks, DateTimeKind.Utc) - DateTime.UtcNow).Ticks / TimeSpan.TicksPerMillisecond);
+                    long nowUtcTicks = DateTime.UtcNow.Ticks;
+                    long maxRetryTicks = nowUtcTicks + TimeSpan.FromMinutes(120).Ticks;
+                    long minRetryTicks = Math.Max(DateTime.MinValue.Ticks, nowUtcTicks - TimeSpan.FromMinutes(120).Ticks);
+                    long retryTicks = Math.Max(minRetryTicks, Math.Min(saved.RetryAtUtcTicks, maxRetryTicks));
+                    long remaining = Math.Max(0, (retryTicks - nowUtcTicks) / TimeSpan.TicksPerMillisecond);
                     updateRetryAt = Now + remaining;
                 }
                 log.Commit("[update] Resuming a saved partial update to " + partialPinnedSha + ".");
@@ -1844,7 +1856,7 @@ namespace WanGPLauncher
             string currentHead, headError;
             if (!ReadHead(out currentHead, out headError) || (currentHead != oldHead && currentHead != pinnedSha))
             {
-                LogPartialRepair(localFiles, null, pinnedSha, headError == null ? "HEAD changed since the partial update" : headError);
+                LogPartialRepair(files, localFiles, null, pinnedSha, headError == null ? "HEAD changed since the partial update" : headError);
                 abandoned = true;
                 error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
                 return false;
@@ -1852,7 +1864,7 @@ namespace WanGPLauncher
 
             if (RunTool("git", "merge-base --is-ancestor " + QuoteArgument(oldHead) + " " + QuoteArgument(pinnedSha), false, out output) != 0)
             {
-                LogPartialRepair(localFiles, null, pinnedSha, "the pinned revision is not a descendant of the original HEAD");
+                LogPartialRepair(files, localFiles, null, pinnedSha, "the pinned revision is not a descendant of the original HEAD");
                 abandoned = true;
                 error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
                 return false;
@@ -1876,6 +1888,26 @@ namespace WanGPLauncher
             var candidateFiles = new List<string>();
             foreach (UpdateFile file in files)
                 if (!localFiles.Contains(file.Path)) candidateFiles.Add(file.Path);
+            var directoryDeletes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (UpdateFile file in files)
+            {
+                if (file.Status != 'D' || localFiles.Contains(file.Path)) continue;
+                string full;
+                if (!TryGetUpdateFullPath(file.Path, out full))
+                {
+                    error = "Could not safely resolve deleted update path " + DisplayUpdatePath(file.Path) + ".";
+                    return false;
+                }
+                FileAttributes attributes;
+                bool exists;
+                if (!TryReadUpdateAttributes(file.Path, full, out attributes, out exists, out error)) return false;
+                if (exists && (attributes & FileAttributes.Directory) != 0)
+                {
+                    directoryDeletes.Add(file.Path);
+                    log.Commit("[update] Deleted update path is already removed (directory present): " + DisplayUpdatePath(file.Path));
+                }
+            }
+            candidateFiles.RemoveAll(delegate (string path) { return directoryDeletes.Contains(path); });
             Dictionary<string, string> workingHashes;
             if (!TryHashWorkingFiles(candidateFiles, out workingHashes, out error)) return false;
 
@@ -1883,7 +1915,7 @@ namespace WanGPLauncher
             var deleteFiles = new List<string>();
             foreach (UpdateFile file in files)
             {
-                if (localFiles.Contains(file.Path)) continue;
+                if (localFiles.Contains(file.Path) || directoryDeletes.Contains(file.Path)) continue;
                 string workingHash;
                 if (workingHashes.TryGetValue(file.Path, out workingHash))
                 {
@@ -1938,6 +1970,7 @@ namespace WanGPLauncher
 
             foreach (string path in deleteFiles)
             {
+                if (directoryDeletes.Contains(path)) continue;
                 string full;
                 if (!TryGetUpdateFullPath(path, out full))
                 {
@@ -1952,7 +1985,20 @@ namespace WanGPLauncher
                     error = "Could not remove deleted update path " + DisplayUpdatePath(path) + ": the path is a directory.";
                     return false;
                 }
-                try { if (exists) File.Delete(full); }
+                try
+                {
+                    if (exists)
+                    {
+                        if ((attributes & FileAttributes.ReadOnly) != 0)
+                            File.SetAttributes(full, attributes & ~FileAttributes.ReadOnly);
+                        File.Delete(full);
+                    }
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    error = "cannot write " + DisplayUpdatePath(path) + ": access denied";
+                    return false;
+                }
                 catch (Exception e)
                 {
                     error = "Could not remove deleted update path " + DisplayUpdatePath(path) + ": " + e.Message;
@@ -1963,13 +2009,13 @@ namespace WanGPLauncher
             bool headRead = ReadHead(out currentHead, out headError);
             HashSet<string> leftovers;
             string diffError;
-            bool diffRead = ReadLeftoverPaths(localFiles, out leftovers, out diffError);
+            bool diffRead = ReadLeftoverPaths(files, localFiles, out leftovers, out diffError);
             bool verified = headRead && currentHead == pinnedSha && diffRead && leftovers.Count == 0;
             if (!verified)
             {
                 string reason = !headRead ? headError : currentHead != pinnedSha ? "HEAD does not match the pinned update revision" :
                     !diffRead ? diffError : "update files remain different from HEAD";
-                LogPartialRepair(localFiles, diffRead ? leftovers : null, pinnedSha, reason);
+                LogPartialRepair(files, localFiles, diffRead ? leftovers : null, pinnedSha, reason);
                 error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
                 return false;
             }
@@ -2051,7 +2097,7 @@ namespace WanGPLauncher
             return true;
         }
 
-        bool ReadLeftoverPaths(HashSet<string> localFiles, out HashSet<string> leftovers, out string error)
+        bool ReadLeftoverPaths(List<UpdateFile> files, HashSet<string> localFiles, out HashSet<string> leftovers, out string error)
         {
             leftovers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             error = null;
@@ -2067,19 +2113,23 @@ namespace WanGPLauncher
                 error = "git returned an invalid verification file list";
                 return false;
             }
+            var updatePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (files != null)
+                foreach (UpdateFile file in files)
+                    if (file != null && IsSafeUpdatePath(file.Path)) updatePaths.Add(file.Path);
             foreach (string path in changed)
-                if (!localFiles.Contains(path)) leftovers.Add(path);
+                if (updatePaths.Contains(path) && (localFiles == null || !localFiles.Contains(path))) leftovers.Add(path);
             return true;
         }
 
-        void LogPartialRepair(HashSet<string> localFiles, HashSet<string> leftovers, string pinnedSha, string reason)
+        void LogPartialRepair(List<UpdateFile> files, HashSet<string> localFiles, HashSet<string> leftovers, string pinnedSha, string reason)
         {
             log.Commit("[update] Automatic completion could not verify the update: " + reason + ".");
             if (leftovers == null)
             {
                 string error;
                 HashSet<string> found;
-                if (localFiles != null && ReadLeftoverPaths(localFiles, out found, out error)) leftovers = found;
+                if (localFiles != null && ReadLeftoverPaths(files, localFiles, out found, out error)) leftovers = found;
             }
             if (leftovers == null) log.Commit("[update] Leftover paths could not be listed.");
             else if (leftovers.Count == 0) log.Commit("[update] Leftover paths: none.");
@@ -2093,6 +2143,18 @@ namespace WanGPLauncher
                 }
                 if (leftovers.Count > 20) log.Commit("[update] " + (leftovers.Count - 20) + " more leftover path(s) not shown.");
             }
+            bool divergedOrMoved = reason != null &&
+                (reason.IndexOf("not a descendant", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 reason.IndexOf("HEAD changed", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 reason.IndexOf("HEAD moved", StringComparison.OrdinalIgnoreCase) >= 0);
+            if (divergedOrMoved)
+            {
+                log.Commit("[update] The branch has diverged or moved and must be reconciled by hand in the WanGP folder:");
+                log.Commit("[update]   git status");
+                string divergedRevision = IsGitSha(pinnedSha) ? pinnedSha : "<pinned-sha>";
+                log.Commit("[update]   git log --oneline HEAD.." + divergedRevision);
+                return;
+            }
             log.Commit("[update] Manual repair in the WanGP folder:");
             string revision = IsGitSha(pinnedSha) ? pinnedSha : "<pinned-sha>";
             log.Commit("[update]   git reset --mixed \"" + revision + "\"");
@@ -2102,11 +2164,13 @@ namespace WanGPLauncher
                 foreach (string path in leftovers)
                 {
                     if (shown++ == 20) break;
+                    if (files == null || !files.Exists(delegate (UpdateFile f) { return f != null && String.Equals(f.Path, path, StringComparison.OrdinalIgnoreCase); }) ||
+                        (localFiles != null && localFiles.Contains(path))) continue;
                     string literalPath = ":(literal)" + path;
                     log.Commit("[update]   git checkout \"" + revision + "\" -- " + PowerShellQuote(literalPath));
                 }
             }
-            else log.Commit("[update]   For each leftover path, run git checkout \"" + revision + "\" -- '<path>'.");
+            else log.Commit("[update]   No update-set paths need checkout.");
         }
 
         string PowerShellQuote(string value)
@@ -2183,7 +2247,9 @@ namespace WanGPLauncher
                 log.Commit("[update] Could not persist partial update state: " + saveError);
             }
             log.Commit("[update] " + error);
-            ShowBalloon("WanGP update failed", error + ". WanGP remains stopped because the update is partial. Click for the log.",
+            const string resumeInstruction = "fix the problem, then use Update WanGP now or restart the tray";
+            log.Commit("[update] " + resumeInstruction);
+            ShowBalloon("WanGP update failed", error + ". WanGP remains stopped because the update is partial. " + resumeInstruction,
                 ToolTipIcon.Warning, ShowLog);
             SetState(State.Stopped);
         }

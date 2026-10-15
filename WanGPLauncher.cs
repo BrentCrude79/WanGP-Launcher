@@ -3467,20 +3467,20 @@ namespace WanGPLauncher
             }
             client.ReceiveTimeout = 0;
             client.SendTimeout = 0;
-            if (!PrepareMcpRequest(stream, req)) return;
+            if (!PrepareMcpRequest(stream, req, true)) return; // the tunnel serves one request per connection
             ForwardMcp(client, stream, reader, req, true, token);
         }
 
-        bool PrepareMcpRequest(Stream stream, HttpRequest req)
+        bool PrepareMcpRequest(Stream stream, HttpRequest req, bool close = false)
         {
             if (proc != null && mode == Mode.Mcp && !stopping) return true;
-            if (AnswerMcpLocally(stream, req)) return false;
+            if (AnswerMcpLocally(stream, req, close)) return false;
             Interlocked.Exchange(ref lastMcpUseAt, Now);
             Avail a = Ask(Mode.Mcp);
             if (a == Avail.Ready || a == Avail.Starting) return true;
             WriteMcpRefusal(stream, req, a == Avail.Busy
                 ? "WanGP is busy: a person is using its web UI right now. Try again in a few minutes."
-                : "WanGP failed to start. Check the WanGP tray console log.");
+                : "WanGP failed to start. Check the WanGP tray console log.", close);
             return false;
         }
 
@@ -3656,18 +3656,18 @@ namespace WanGPLauncher
             return false;
         }
 
-        bool AnswerMcpLocally(Stream stream, HttpRequest req)
+        bool AnswerMcpLocally(Stream stream, HttpRequest req, bool close = false)
         {
             if (req.Method == "GET" || req.Method == "DELETE")
             {
                 // No server-to-client stream and no session to end while WanGP sleeps.
-                WriteResponse(stream, "405 Method Not Allowed", "text/plain", "", false, "Allow: POST\r\n");
+                WriteResponse(stream, "405 Method Not Allowed", "text/plain", "", close, "Allow: POST\r\n");
                 return true;
             }
             if (req.Method != "POST" || req.Rpc == null) return false;
             if (!req.Rpc.ContainsKey("id"))
             {
-                WriteResponse(stream, "202 Accepted", "text/plain", "", false); // notification
+                WriteResponse(stream, "202 Accepted", "text/plain", "", close); // notification
                 return true;
             }
             Dictionary<string, object> reply;
@@ -3684,11 +3684,11 @@ namespace WanGPLauncher
             }
             reply["jsonrpc"] = "2.0";
             reply["id"] = req.Rpc["id"];
-            WriteResponse(stream, "200 OK", "application/json", McpCache.Json.Serialize(reply), false);
+            WriteResponse(stream, "200 OK", "application/json", McpCache.Json.Serialize(reply), close);
             return true;
         }
 
-        void WriteMcpRefusal(Stream stream, HttpRequest req, string message)
+        void WriteMcpRefusal(Stream stream, HttpRequest req, string message, bool close = false)
         {
             if (req.Rpc == null || !req.Rpc.ContainsKey("id"))
             {
@@ -3702,7 +3702,7 @@ namespace WanGPLauncher
                     { "isError", true } };
             else
                 reply["error"] = new Dictionary<string, object> { { "code", -32000 }, { "message", message } };
-            WriteResponse(stream, "200 OK", "application/json", McpCache.Json.Serialize(reply), false);
+            WriteResponse(stream, "200 OK", "application/json", McpCache.Json.Serialize(reply), close);
         }
 
         static void WriteResponse(Stream stream, string status, string type, string body, bool close, string extraHeaders = "")
@@ -4061,9 +4061,12 @@ namespace WanGPLauncher
 
         public HttpRequest ReadTunnelHead()
         {
-            int headEnd;
-            while ((headEnd = Find(buf, len, "\r\n\r\n")) < 0)
+            int headEnd, scanFrom = 0;
+            while ((headEnd = Find(buf, len, "\r\n\r\n", scanFrom)) < 0)
+            {
+                scanFrom = Math.Max(0, len - 3); // only the new byte can complete the blank line
                 if (len >= MaxHead || !Fill(1)) return null;
+            }
             var req = new HttpRequest();
             req.Head = Encoding.ASCII.GetString(buf, 0, headEnd);
             string[] first = req.Head.Split(new[] { "\r\n" }, StringSplitOptions.None)[0].Split(' ');

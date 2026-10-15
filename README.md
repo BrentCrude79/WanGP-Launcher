@@ -33,9 +33,9 @@ window you can open from the tray.
 
 Choose **Share MCP server online (Cloudflare tunnel)** in the tray menu when a cloud agent needs WanGP. This requires
 `cloudflared`; install it with `winget install --id Cloudflare.cloudflared`. The launcher starts a Cloudflare quick
-tunnel for the MCP port and copies its URL, including a secret path token, to the clipboard. The URL changes every time
-the tunnel starts. Anyone who has the full URL can use WanGP while the tunnel is on, so turn it off as soon as the
-agent is finished.
+tunnel through its dedicated localhost-only port 7862 and copies the URL, including a secret path token, to the
+clipboard. Notifications do not show the URL. The URL changes every time the tunnel starts. Anyone who has the full
+URL can use WanGP while the tunnel is on, so turn it off as soon as the agent is finished.
 
 Cloudflare quick tunnels have no uptime guarantee. Cloudflare also documents that quick tunnels do not support
 Server-Sent Events, so streaming MCP responses may not work through them.

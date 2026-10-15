@@ -17,6 +17,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -597,6 +598,7 @@ namespace WanGPLauncher
         static readonly Regex WorkLine = new Regex(@"^(Loading |Hooked to model|Lora ')|%\||prompt enhancement|Decode=|denoising", RegexOptions.Compiled);
         static readonly Regex DecodeRate = new Regex(@"Decode=(\d+(?:\.\d+)?)\s*tok/s", RegexOptions.Compiled);
         static readonly Regex Percent = new Regex(@"(\d{1,3})%\|", RegexOptions.Compiled);
+        static readonly Regex TunnelUrl = new Regex(@"https://([a-z0-9-]+\.trycloudflare\.com)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
         // Errors after which WanGP stays up but can no longer generate, and keeps holding its RAM and pinned memory.
         static readonly Regex FatalLine = new Regex(@"^Exception in thread |WinError 14(50|55)\]|^MemoryError\b|no attribute 'tiny_vae'", RegexOptions.Compiled);
         const long FatalSettleMs = 15000; // let the traceback finish and any pending save complete before stopping
@@ -607,9 +609,11 @@ namespace WanGPLauncher
 
         readonly Icon appIcon, iconStarting, iconRunning, iconStopped;
         readonly ToolStripMenuItem startItem, stopItem, restartItem, autostartItem, forceMcpItem, autoUpdateItem, updateNowItem;
+        readonly ToolStripMenuItem tunnelItem, copyTunnelUrlItem;
         readonly ToolStripMenuItem changeFolderItem;
         readonly System.Windows.Forms.Timer uiTimer = new System.Windows.Forms.Timer();
         readonly object jobLock = new object();
+        readonly object tunnelJobLock = new object();
         // Set while WanGP works, so the Kobold tray unloads koboldcpp and stays unloaded: WanGP takes precedence.
         readonly EventWaitHandle busyEvent = new EventWaitHandle(false, EventResetMode.ManualReset, @"Local\WanGP.Busy.Tray");
         readonly object watchLock = new object();
@@ -645,6 +649,13 @@ namespace WanGPLauncher
         LogForm logForm;
         Process proc;
         IntPtr job = IntPtr.Zero;
+        IntPtr tunnelJob = IntPtr.Zero;
+        Process tunnelProc;
+        volatile string tunnelHost, tunnelToken;
+        string onlineTunnelUrl;
+        volatile int tunnelEpoch;
+        long tunnelStartAt;
+        bool tunnelStarting, updatingTunnelCheck;
         bool stopping, exiting;
         int port = 7860; // public GUI port
         State state = State.Stopped;
@@ -691,6 +702,17 @@ namespace WanGPLauncher
             forceMcpItem = new ToolStripMenuItem("Keep MCP server running (port " + McpPort + ")", null, delegate { SetForceMcp(!forceMcp); });
             forceMcpItem.Checked = forceMcp;
             menu.Items.Add(forceMcpItem);
+            tunnelItem = new ToolStripMenuItem("Share MCP server online (Cloudflare tunnel)");
+            tunnelItem.CheckOnClick = true;
+            tunnelItem.CheckedChanged += delegate
+            {
+                if (updatingTunnelCheck) return;
+                if (tunnelItem.Checked) StartTunnel(); else StopTunnel();
+            };
+            menu.Items.Add(tunnelItem);
+            copyTunnelUrlItem = new ToolStripMenuItem("Copy online MCP URL", null, delegate { CopyTunnelUrl(); });
+            copyTunnelUrlItem.Enabled = false;
+            menu.Items.Add(copyTunnelUrlItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("Edit launch arguments", null, delegate { Program.ReadArgs(argsFile); Process.Start("notepad.exe", "\"" + argsFile + "\""); }));
             menu.Items.Add(new ToolStripMenuItem("Open WanGP folder", null, delegate { Process.Start("explorer.exe", "\"" + root + "\""); }));
@@ -743,6 +765,7 @@ namespace WanGPLauncher
                 CheckIdle();
                 KeepMcp();
                 MaybeUpdate();
+                CheckTunnelTimeout();
                 SampleCpu();
                 // Model loads and some post-processing print nothing for minutes: stay busy while WanGP still uses the CPU or GPU.
                 if (busy == 1 && proc != null && Now - Interlocked.Read(ref lastWorkAt) > BusyHoldMs && StillWorking())
@@ -1760,6 +1783,8 @@ namespace WanGPLauncher
         void ExitApp()
         {
             exiting = true;
+            StopTunnel();
+            CloseTunnelJob();
             showStop.Set();
             foreach (TcpListener l in new[] { guiListener, mcpListener })
                 if (l != null) try { l.Stop(); } catch (Exception) { }
@@ -2029,6 +2054,315 @@ namespace WanGPLauncher
             try { Process.Start(Url); } catch (Exception) { }
         }
 
+        void StartTunnel()
+        {
+            int epoch = ++tunnelEpoch;
+            string token;
+            try { token = NewTunnelToken(); }
+            catch (Exception e)
+            {
+                log.Commit("[tunnel] Could not create a secret token: " + e.Message);
+                StopTunnel();
+                ShowBalloon("Cloudflare tunnel failed", "Could not create a secret token. Click for the log.", ToolTipIcon.Warning, ShowLog);
+                return;
+            }
+            tunnelHost = null;
+            tunnelToken = token;
+            onlineTunnelUrl = null;
+            copyTunnelUrlItem.Enabled = false;
+            tunnelStarting = true;
+            tunnelStartAt = Now;
+            log.Commit("[tunnel] Looking for cloudflared.");
+            if (!EnsureTunnelJob())
+            {
+                TunnelStartFailed(epoch, token, "Could not create the Windows job object.");
+                return;
+            }
+
+            var thread = new Thread(delegate ()
+            {
+                string executable = null, error = null;
+                try { executable = FindCloudflared(epoch); }
+                catch (Exception e) { error = e.Message; }
+                try
+                {
+                    ui.BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (error != null) TunnelStartFailed(epoch, token, error);
+                        else TunnelExecutableFound(epoch, executable);
+                    });
+                }
+                catch (InvalidOperationException) { }
+            });
+            thread.IsBackground = true;
+            thread.Start();
+        }
+
+        static string NewTunnelToken()
+        {
+            byte[] bytes = new byte[24];
+            using (var random = new RNGCryptoServiceProvider()) random.GetBytes(bytes);
+            var token = new StringBuilder(bytes.Length * 2);
+            foreach (byte b in bytes) token.Append(b.ToString("x2", CultureInfo.InvariantCulture));
+            return token.ToString();
+        }
+
+        string FindCloudflared(int epoch)
+        {
+            if (epoch != tunnelEpoch) return null;
+            if (TunnelVersionWorks(epoch)) return "cloudflared";
+            if (epoch != tunnelEpoch) return null;
+            string[] candidates = {
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), @"cloudflared\cloudflared.exe"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"cloudflared\cloudflared.exe"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Microsoft\WinGet\Links\cloudflared.exe")
+            };
+            foreach (string candidate in candidates)
+            {
+                if (epoch != tunnelEpoch) return null;
+                if (File.Exists(candidate)) return candidate;
+            }
+            return null;
+        }
+
+        bool TunnelVersionWorks(int epoch)
+        {
+            try
+            {
+                using (var p = new Process())
+                {
+                    p.StartInfo = new ProcessStartInfo("cloudflared", "--version");
+                    p.StartInfo.UseShellExecute = false;
+                    p.StartInfo.CreateNoWindow = true;
+                    p.StartInfo.RedirectStandardInput = true;
+                    p.Start();
+                    if (!AssignTunnelProcess(p, epoch))
+                    {
+                        if (p.HasExited) return p.ExitCode == 0;
+                        KillTree(p.Id);
+                        p.WaitForExit(1000);
+                        return false;
+                    }
+                    p.StandardInput.Close();
+                    for (int i = 0; i < 100; i++)
+                    {
+                        if (epoch != tunnelEpoch)
+                        {
+                            KillTree(p.Id);
+                            p.WaitForExit(1000);
+                            return false;
+                        }
+                        if (p.WaitForExit(100)) return p.ExitCode == 0;
+                    }
+                    KillTree(p.Id);
+                    p.WaitForExit(1000);
+                    return false;
+                }
+            }
+            catch (Exception) { return false; }
+        }
+
+        void TunnelExecutableFound(int epoch, string executable)
+        {
+            if (epoch != tunnelEpoch || !tunnelItem.Checked) return;
+            if (executable == null)
+            {
+                StopTunnel();
+                if (MessageBox.Show("cloudflared is needed to share the MCP server online. Install it with `winget install --id Cloudflare.cloudflared`, or open the Cloudflare download instructions?", "WanGP launcher", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)
+                    try { Process.Start("https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"); } catch (Exception) { }
+                return;
+            }
+            StartTunnelProcess(epoch, executable, tunnelToken);
+        }
+
+        bool EnsureTunnelJob()
+        {
+            lock (tunnelJobLock)
+            {
+                if (tunnelJob != IntPtr.Zero) return true;
+                IntPtr handle = Native.CreateJobObject(IntPtr.Zero, null);
+                if (handle == IntPtr.Zero) return false;
+                var info = new Native.JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+                info.BasicLimitInformation.LimitFlags = Native.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if (!Native.SetInformationJobObject(handle, Native.JobObjectExtendedLimitInformation, ref info,
+                    Marshal.SizeOf(typeof(Native.JOBOBJECT_EXTENDED_LIMIT_INFORMATION))))
+                {
+                    Native.CloseHandle(handle);
+                    return false;
+                }
+                tunnelJob = handle;
+                return true;
+            }
+        }
+
+        bool AssignTunnelProcess(Process p, int epoch)
+        {
+            lock (tunnelJobLock)
+                return epoch == tunnelEpoch && tunnelJob != IntPtr.Zero && Native.AssignProcessToJobObject(tunnelJob, p.Handle);
+        }
+
+        void TerminateTunnelJob()
+        {
+            lock (tunnelJobLock)
+                if (tunnelJob != IntPtr.Zero) Native.TerminateJobObject(tunnelJob, 1);
+        }
+
+        void StartTunnelProcess(int epoch, string executable, string token)
+        {
+            Process p = new Process();
+            int outputFound = 0;
+            try
+            {
+                p.StartInfo = new ProcessStartInfo(executable, "tunnel --no-autoupdate --url http://127.0.0.1:" + McpPort);
+                p.StartInfo.UseShellExecute = false;
+                p.StartInfo.CreateNoWindow = true;
+                p.StartInfo.WindowStyle = ProcessWindowStyle.Hidden;
+                p.StartInfo.RedirectStandardInput = true;
+                p.StartInfo.RedirectStandardOutput = true;
+                p.StartInfo.RedirectStandardError = true;
+                p.StartInfo.StandardOutputEncoding = new UTF8Encoding(false);
+                p.StartInfo.StandardErrorEncoding = new UTF8Encoding(false);
+                p.OutputDataReceived += delegate (object sender, DataReceivedEventArgs e)
+                {
+                    if (e.Data != null) TunnelOutput(epoch, token, p, e.Data, ref outputFound);
+                };
+                p.ErrorDataReceived += delegate (object sender, DataReceivedEventArgs e)
+                {
+                    if (e.Data != null) TunnelOutput(epoch, token, p, e.Data, ref outputFound);
+                };
+                p.Exited += delegate
+                {
+                    int code = -1;
+                    try { p.WaitForExit(3000); code = p.ExitCode; } catch (Exception) { }
+                    try { ui.BeginInvoke((MethodInvoker)delegate { TunnelExited(p, epoch, token, code); }); }
+                    catch (InvalidOperationException) { }
+                };
+                p.EnableRaisingEvents = true;
+                if (!p.Start()) throw new InvalidOperationException("cloudflared did not start.");
+                tunnelProc = p;
+                if (!AssignTunnelProcess(p, epoch))
+                    throw new InvalidOperationException("Could not add cloudflared to the Windows job object.");
+                p.StandardInput.Close();
+                p.BeginOutputReadLine();
+                p.BeginErrorReadLine();
+                TunnelLog(token, "Started cloudflared.");
+            }
+            catch (Exception e)
+            {
+                if (tunnelProc == p) tunnelProc = null;
+                try { if (p.Id > 0) KillTree(p.Id); } catch (Exception) { }
+                try { TerminateTunnelJob(); } catch (Exception) { }
+                try { p.Dispose(); } catch (Exception) { }
+                TunnelStartFailed(epoch, token, e.Message);
+            }
+        }
+
+        void TunnelOutput(int epoch, string token, Process p, string line, ref int outputFound)
+        {
+            TunnelLog(token, line);
+            Match match = TunnelUrl.Match(line);
+            if (match.Success && Interlocked.CompareExchange(ref outputFound, 1, 0) == 0)
+            {
+                string host = match.Groups[1].Value.ToLowerInvariant();
+                try { ui.BeginInvoke((MethodInvoker)delegate { TunnelOnline(p, epoch, token, host); }); }
+                catch (InvalidOperationException) { }
+            }
+        }
+
+        void TunnelOnline(Process p, int epoch, string token, string host)
+        {
+            if (p != tunnelProc || epoch != tunnelEpoch || !tunnelItem.Checked || !Object.ReferenceEquals(tunnelToken, token)) return;
+            tunnelHost = host;
+            tunnelStarting = false;
+            onlineTunnelUrl = "https://" + host + "/" + token + "/mcp";
+            copyTunnelUrlItem.Enabled = true;
+            TunnelLog(token, "Online: https://" + host + "/<token>/mcp");
+            try { Clipboard.SetText(onlineTunnelUrl); } catch (Exception) { }
+            ShowBalloon("WanGP MCP server is online", onlineTunnelUrl, ToolTipIcon.Info, null);
+        }
+
+        void TunnelExited(Process p, int epoch, string token, int code)
+        {
+            if (p != tunnelProc || epoch != tunnelEpoch) return;
+            tunnelProc = null;
+            try { KillTree(p.Id); } catch (Exception) { }
+            try { TerminateTunnelJob(); } catch (Exception) { }
+            try { p.Dispose(); } catch (Exception) { }
+            ++tunnelEpoch;
+            ClearTunnelState();
+            TunnelLog(token, "cloudflared exited with code " + code + ".");
+            log.Commit("[tunnel] Stopped.");
+            if (!exiting)
+                ShowBalloon("Cloudflare tunnel stopped", "The tunnel exited unexpectedly. Click for the log.", ToolTipIcon.Warning, ShowLog);
+        }
+
+        void TunnelStartFailed(int epoch, string token, string message)
+        {
+            if (epoch != tunnelEpoch) return;
+            TunnelLog(token, "Could not start cloudflared: " + message);
+            StopTunnel();
+            ShowBalloon("Cloudflare tunnel failed", "Click for the log.", ToolTipIcon.Warning, ShowLog);
+        }
+
+        void TunnelLog(string token, string line)
+        {
+            if (token != null && line != null) line = line.Replace(token, "<token>");
+            log.Commit("[tunnel] " + line);
+        }
+
+        void CheckTunnelTimeout()
+        {
+            if (tunnelStarting && tunnelItem.Checked && tunnelHost == null && Now - tunnelStartAt >= 30000)
+            {
+                StopTunnel();
+                ShowBalloon("Cloudflare tunnel did not start", "Click for the log.", ToolTipIcon.Warning, ShowLog);
+            }
+        }
+
+        void StopTunnel()
+        {
+            ++tunnelEpoch;
+            Process p = tunnelProc;
+            tunnelProc = null;
+            ClearTunnelState();
+            if (p != null)
+            {
+                try { KillTree(p.Id); } catch (Exception) { }
+                try { p.WaitForExit(3000); } catch (Exception) { }
+                try { p.Dispose(); } catch (Exception) { }
+            }
+            try { TerminateTunnelJob(); } catch (Exception) { }
+            log.Commit("[tunnel] Stopped.");
+        }
+
+        void ClearTunnelState()
+        {
+            tunnelStarting = false;
+            tunnelHost = null;
+            tunnelToken = null;
+            onlineTunnelUrl = null;
+            copyTunnelUrlItem.Enabled = false;
+            updatingTunnelCheck = true;
+            tunnelItem.Checked = false;
+            updatingTunnelCheck = false;
+        }
+
+        void CopyTunnelUrl()
+        {
+            if (String.IsNullOrEmpty(onlineTunnelUrl)) return;
+            try { Clipboard.SetText(onlineTunnelUrl); }
+            catch (Exception) { MessageBox.Show("Could not copy the online MCP URL to the clipboard.", "WanGP launcher", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        }
+
+        void CloseTunnelJob()
+        {
+            lock (tunnelJobLock)
+            {
+                if (tunnelJob != IntPtr.Zero) Native.CloseHandle(tunnelJob);
+                tunnelJob = IntPtr.Zero;
+            }
+        }
+
         void OpenLogFile()
         {
             if (File.Exists(logFile)) Process.Start("notepad.exe", "\"" + logFile + "\"");
@@ -2259,11 +2593,36 @@ namespace WanGPLauncher
             NetworkStream stream = client.GetStream();
             var reader = new HttpReader(stream);
             HttpRequest req;
+            bool tunnelRequest = false;
+            string authorizedTunnelToken = null;
             while (true)
             {
-                req = reader.Read(true);
+                req = reader.Read(true, delegate (HttpRequest candidate)
+                {
+                    string ignored;
+                    return IsTunnelRequest(candidate, out ignored);
+                });
                 if (req == null) return;
-                if (!HostAllowed(req.Header("Host")))
+                authorizedTunnelToken = null;
+                string tunnelSnapshot;
+                tunnelRequest = IsTunnelRequest(req, out tunnelSnapshot);
+                if (tunnelRequest)
+                {
+                    string token = tunnelToken;
+                    string rewritten;
+                    if (req.InvalidTunnelBody || !AuthorizeTunnelRequest(req, tunnelSnapshot, token, out rewritten))
+                    {
+                        WriteResponse(stream, "404 Not Found", "text/plain; charset=utf-8", "Not found.", true);
+                        return;
+                    }
+                    authorizedTunnelToken = token;
+                    if (!req.RewriteTunnelRequest(rewritten))
+                    {
+                        WriteResponse(stream, "404 Not Found", "text/plain; charset=utf-8", "Not found.", true);
+                        return;
+                    }
+                }
+                else if (!HostAllowed(req.Header("Host")))
                 {
                     WriteResponse(stream, "421 Misdirected Request", "text/plain; charset=utf-8", "Unknown Host header. Use http://" +
                         Environment.MachineName.ToLowerInvariant() + ":" + McpPort + "/mcp or this PC's IP address.", true);
@@ -2290,13 +2649,17 @@ namespace WanGPLauncher
                 }
                 IPAddress peer = ((IPEndPoint)client.Client.RemoteEndPoint).Address;
                 if (req.Method == "POST" && (req.Path ?? "").Contains("/mcp"))
-                    log.Commit("[launcher] Agent request" + (IPAddress.IsLoopback(peer) ? "" : " from " + peer) + ": " + (req.RpcMethod ?? req.Method));
-                byte[] first = IsLoopbackHost(req.Header("Host")) ? req.Raw : AsLocalRequest(req);
-                byte[] rest = reader.Leftover();
+                {
+                    string rpcMethod = req.RpcMethod ?? req.Method;
+                    if (authorizedTunnelToken != null) rpcMethod = rpcMethod.Replace(authorizedTunnelToken, "<token>");
+                    log.Commit("[launcher] Agent request" + (IPAddress.IsLoopback(peer) ? "" : " from " + peer) + ": " + rpcMethod);
+                }
+                byte[] first = !tunnelRequest && IsLoopbackHost(req.Header("Host")) ? req.Raw : AsLocalRequest(req);
+                byte[] rest = tunnelRequest ? new byte[0] : reader.Leftover();
                 byte[] prefix = new byte[first.Length + rest.Length];
                 Buffer.BlockCopy(first, 0, prefix, 0, first.Length);
                 Buffer.BlockCopy(rest, 0, prefix, first.Length, rest.Length);
-                Relay(conn, Mode.Mcp, prefix);
+                Relay(conn, Mode.Mcp, prefix, tunnelRequest);
             }
             finally
             {
@@ -2336,6 +2699,79 @@ namespace WanGPLauncher
             }
             int colon = host.IndexOf(':');
             return (colon >= 0 ? host.Substring(0, colon) : host).TrimEnd('.');
+        }
+
+        bool IsTunnelRequest(HttpRequest req, out string hostSnapshot)
+        {
+            hostSnapshot = tunnelHost;
+            if (req.HasHeader("Cf-Connecting-Ip") || req.HasHeader("Cf-Ray") || req.HasHeader("Cdn-Loop")) return true;
+            if (hostSnapshot == null) return false;
+            foreach (string host in req.HeaderValues("Host"))
+                if (HostName(host) == hostSnapshot) return true;
+            return false;
+        }
+
+        bool AuthorizeTunnelRequest(HttpRequest req, string hostSnapshot, string token, out string rewritten)
+        {
+            rewritten = null;
+            if (hostSnapshot == null || token == null || !Object.ReferenceEquals(tunnelHost, hostSnapshot) ||
+                !Object.ReferenceEquals(tunnelToken, token) || !ValidTunnelRequestLine(req)) return false;
+
+            string target = req.Path;
+            if (!SafeTunnelTarget(target)) return false;
+            int queryAt = target.IndexOf('?');
+            string path = queryAt < 0 ? target : target.Substring(0, queryAt);
+            string query = queryAt < 0 ? "" : target.Substring(queryAt);
+            int slashAt = path.IndexOf('/', 1);
+            string supplied = slashAt < 0 ? path.Substring(1) : path.Substring(1, slashAt - 1);
+            if (!ConstantTimeTokenEquals(supplied, token)) return false;
+
+            rewritten = (slashAt < 0 ? "/" : path.Substring(slashAt)) + query;
+            if (!SafeTunnelTarget(rewritten) || req.HasHeader("Transfer-Encoding") && req.HeaderValues("Transfer-Encoding").Count != 1)
+                return false;
+            return Object.ReferenceEquals(tunnelHost, hostSnapshot) && Object.ReferenceEquals(tunnelToken, token);
+        }
+
+        static bool ConstantTimeTokenEquals(string supplied, string token)
+        {
+            if (supplied == null || token == null) return false;
+            int difference = supplied.Length ^ token.Length;
+            for (int i = 0; i < token.Length; i++)
+                difference |= token[i] ^ (i < supplied.Length ? supplied[i] : (char)0);
+            return difference == 0;
+        }
+
+        static bool ValidTunnelRequestLine(HttpRequest req)
+        {
+            if (req == null || String.IsNullOrEmpty(req.Head)) return false;
+            if (req.Raw == null || req.Raw.Length < req.Head.Length + 4) return false;
+            for (int i = 0; i < req.Head.Length; i++)
+            {
+                if (req.Raw[i] == '\r' && i + 1 < req.Head.Length && req.Raw[i + 1] == '\n') break;
+                if (req.Raw[i] < 0x20 || req.Raw[i] > 0x7e) return false;
+            }
+            string[] lines = req.Head.Split(new[] { "\r\n" }, StringSplitOptions.None);
+            string[] parts = lines[0].Split(' ');
+            return parts.Length == 3 && parts[0] == req.Method && parts[1] == req.Path &&
+                (parts[2] == "HTTP/1.0" || parts[2] == "HTTP/1.1") &&
+                Regex.IsMatch(parts[0], @"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$");
+        }
+
+        static bool SafeTunnelTarget(string target)
+        {
+            if (String.IsNullOrEmpty(target) || target.Length > 8192 || target[0] != '/' || target.StartsWith("//") ||
+                target.IndexOf('\\') >= 0 || target.IndexOf('#') >= 0) return false;
+            for (int i = 0; i < target.Length; i++)
+                if (target[i] < 0x21 || target[i] > 0x7e) return false;
+            int queryAt = target.IndexOf('?');
+            string path = queryAt < 0 ? target : target.Substring(0, queryAt);
+            if (Regex.IsMatch(path, @"%(?:25)*(2f|5c)", RegexOptions.IgnoreCase) || path.IndexOf("//", StringComparison.Ordinal) >= 0) return false;
+            foreach (string segment in path.Split('/'))
+            {
+                string dots = Regex.Replace(segment, @"%(?:25)*2e", ".", RegexOptions.IgnoreCase);
+                if (dots == "." || dots == "..") return false;
+            }
+            return true;
         }
 
         static bool IsLoopbackHost(string host)
@@ -2460,6 +2896,11 @@ namespace WanGPLauncher
 
         void Relay(Conn conn, Mode m, byte[] prefix)
         {
+            Relay(conn, m, prefix, false);
+        }
+
+        void Relay(Conn conn, Mode m, byte[] prefix, bool oneShot)
+        {
             var server = new TcpClient();
             server.NoDelay = true;
             try
@@ -2471,11 +2912,16 @@ namespace WanGPLauncher
                     server.GetStream().Write(prefix, 0, prefix.Length);
                     conn.LastUp = Now;
                 }
-                var up = new Thread(delegate () { Pipe(conn.Client, server, conn, true); });
-                up.IsBackground = true;
-                up.Start();
-                Pipe(server, conn.Client, conn, false);
-                up.Join();
+                if (oneShot)
+                    Pipe(server, conn.Client, conn, false);
+                else
+                {
+                    var up = new Thread(delegate () { Pipe(conn.Client, server, conn, true); });
+                    up.IsBackground = true;
+                    up.Start();
+                    Pipe(server, conn.Client, conn, false);
+                    up.Join();
+                }
             }
             finally
             {
@@ -2653,11 +3099,50 @@ namespace WanGPLauncher
         public byte[] Raw;                       // the bytes to forward for this request
         public Dictionary<string, object> Rpc;   // the JSON-RPC message, when the body is a single one
         public string RpcMethod;
+        public bool InvalidTunnelBody;
 
         public string Header(string name)
         {
-            var m = Regex.Match(Head, @"^" + Regex.Escape(name) + @":[ \t]*(.*?)\r?$", RegexOptions.Multiline | RegexOptions.IgnoreCase);
-            return m.Success ? m.Groups[1].Value : null;
+            List<string> values = HeaderValues(name);
+            return values.Count == 0 ? null : values[0];
+        }
+
+        public List<string> HeaderValues(string name)
+        {
+            var values = new List<string>();
+            MatchCollection matches = Regex.Matches(Head, @"^" + Regex.Escape(name) + @":[ \t]*(.*?)\r?$", RegexOptions.Multiline | RegexOptions.IgnoreCase);
+            foreach (Match match in matches) values.Add(match.Groups[1].Value);
+            return values;
+        }
+
+        public bool HasHeader(string name)
+        {
+            return Regex.IsMatch(Head, @"^" + Regex.Escape(name) + @"[ \t]*:", RegexOptions.Multiline | RegexOptions.IgnoreCase);
+        }
+
+        public bool RewriteTunnelRequest(string target)
+        {
+            if (Raw == null || Head == null || Raw.Length < Head.Length + 4) return false;
+            Encoding latin1 = Encoding.GetEncoding(28591);
+            int bodyAt = Head.Length + 4;
+            string[] lines = latin1.GetString(Raw, 0, Head.Length).Split(new[] { "\r\n" }, StringSplitOptions.None);
+            string[] requestLine = lines[0].Split(' ');
+            if (requestLine.Length != 3) return false;
+            requestLine[1] = target;
+            lines[0] = String.Join(" ", requestLine);
+            var kept = new List<string>();
+            string originHeader = @"^" + Regex.Escape("Origin") + @"[ \t]*:";
+            foreach (string line in lines)
+                if (line.Length == 0 || !Regex.IsMatch(line, originHeader, RegexOptions.IgnoreCase)) kept.Add(line);
+            string newHead = String.Join("\r\n", kept.ToArray());
+            byte[] head = latin1.GetBytes(newHead + "\r\n\r\n");
+            var raw = new byte[head.Length + Raw.Length - bodyAt];
+            Buffer.BlockCopy(head, 0, raw, 0, head.Length);
+            Buffer.BlockCopy(Raw, bodyAt, raw, head.Length, Raw.Length - bodyAt);
+            Head = newHead;
+            Path = target;
+            Raw = raw;
+            return true;
         }
 
         public bool IsPageLoad
@@ -2694,6 +3179,11 @@ namespace WanGPLauncher
         // withBody: read the Content-Length body and parse JSON-RPC; otherwise everything read so far is the request.
         public HttpRequest Read(bool withBody)
         {
+            return Read(withBody, null);
+        }
+
+        public HttpRequest Read(bool withBody, Predicate<HttpRequest> tunnelCheck)
+        {
             int headEnd;
             while ((headEnd = Find(buf, len, "\r\n\r\n")) < 0)
                 if (len >= MaxHead || !Fill()) return null;
@@ -2702,26 +3192,70 @@ namespace WanGPLauncher
             string[] first = req.Head.Split(new[] { "\r\n" }, StringSplitOptions.None)[0].Split(' ');
             req.Method = first[0];
             req.Path = first.Length > 1 ? first[1] : "";
-            int total = headEnd + 4;
+            int headerTotal = headEnd + 4;
+            int total = headerTotal;
+            bool tunnel = withBody && tunnelCheck != null && tunnelCheck(req);
             if (withBody)
             {
-                string cl = req.Header("Content-Length");
+                List<string> contentLengths = req.HeaderValues("Content-Length");
+                List<string> transferEncodings = req.HeaderValues("Transfer-Encoding");
+                string cl = contentLengths.Count == 0 ? null : contentLengths[0];
                 int bodyLen = 0;
-                if (cl != null && (!int.TryParse(cl.Trim(), out bodyLen) || bodyLen < 0 || bodyLen > MaxBody)) return null;
-                if (req.Header("Transfer-Encoding") != null) bodyLen = -1; // chunked: just forward it
-                if (bodyLen > 0)
+                if (tunnel && (contentLengths.Count > 1 || transferEncodings.Count > 1 || (cl != null && transferEncodings.Count > 0)))
+                    req.InvalidTunnelBody = true;
+                bool validLength = true;
+                if (cl != null)
+                {
+                    string value = cl.Trim();
+                    validLength = tunnel
+                        ? Regex.IsMatch(value, @"^[0-9]+$") && int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out bodyLen)
+                        : int.TryParse(value, out bodyLen);
+                }
+                if (req.InvalidTunnelBody)
+                    total = headerTotal;
+                else if (tunnel && transferEncodings.Count > 0)
+                {
+                    int chunkedTotal;
+                    if (!String.Equals(transferEncodings[0].Trim(), "chunked", StringComparison.OrdinalIgnoreCase) ||
+                        !ReadChunked(headerTotal, out chunkedTotal))
+                        req.InvalidTunnelBody = true;
+                    else total = chunkedTotal;
+                }
+                else if (transferEncodings.Count > 0)
+                {
+                    bodyLen = -1; // keep the existing handling for non-tunnel chunked requests
+                    total = len;
+                }
+                else if (cl != null && (!validLength || bodyLen < 0 || bodyLen > MaxBody))
+                {
+                    if (tunnel) req.InvalidTunnelBody = true;
+                    else return null;
+                }
+                else if (bodyLen > 0)
                 {
                     while (len < total + bodyLen)
-                        if (!Fill()) return null;
-                    try
                     {
-                        req.Rpc = McpCache.Json.DeserializeObject(Encoding.UTF8.GetString(buf, total, bodyLen)) as Dictionary<string, object>;
-                        if (req.Rpc != null && req.Rpc.ContainsKey("method")) req.RpcMethod = req.Rpc["method"] as string;
+                        if (!Fill())
+                        {
+                            if (tunnel) req.InvalidTunnelBody = true;
+                            else return null;
+                            break;
+                        }
                     }
-                    catch (Exception) { }
-                    total += bodyLen;
+                    if (!req.InvalidTunnelBody)
+                    {
+                        try
+                        {
+                            req.Rpc = McpCache.Json.DeserializeObject(Encoding.UTF8.GetString(buf, total, bodyLen)) as Dictionary<string, object>;
+                            if (req.Rpc != null && req.Rpc.ContainsKey("method")) req.RpcMethod = req.Rpc["method"] as string;
+                        }
+                        catch (Exception) { }
+                        total += bodyLen;
+                    }
                 }
                 else if (bodyLen < 0) total = len;
+                else if (tunnel && cl == null) total = headerTotal;
+                if (req.InvalidTunnelBody) total = headerTotal;
             }
             else total = len;
             req.Raw = new byte[total];
@@ -2729,6 +3263,54 @@ namespace WanGPLauncher
             Buffer.BlockCopy(buf, total, buf, 0, len - total);
             len -= total;
             return req;
+        }
+
+        bool ReadChunked(int bodyStart, out int total)
+        {
+            total = bodyStart;
+            int cursor = bodyStart, payload = 0, chunks = 0;
+            while (true)
+            {
+                int lineEnd = Find(buf, len, "\r\n", cursor);
+                while (lineEnd < 0)
+                {
+                    if (len - bodyStart > MaxBody + MaxHead || !Fill()) return false;
+                    lineEnd = Find(buf, len, "\r\n", cursor);
+                }
+                if (lineEnd - cursor > 8192) return false;
+                string sizeLine = Encoding.ASCII.GetString(buf, cursor, lineEnd - cursor);
+                int semi = sizeLine.IndexOf(';');
+                string hex = semi < 0 ? sizeLine : sizeLine.Substring(0, semi);
+                int size;
+                if (hex.Length == 0 || hex.Length > 8 || !int.TryParse(hex, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out size)) return false;
+                cursor = lineEnd + 2;
+                if (size == 0)
+                {
+                    while (len < cursor + 2)
+                        if (len - bodyStart > MaxBody + MaxHead || !Fill()) return false;
+                    if (len >= cursor + 2 && buf[cursor] == '\r' && buf[cursor + 1] == '\n')
+                        total = cursor + 2;
+                    else
+                    {
+                        int trailerEnd = Find(buf, len, "\r\n\r\n", cursor);
+                        while (trailerEnd < 0)
+                        {
+                            if (len - cursor > MaxHead || !Fill()) return false;
+                            trailerEnd = Find(buf, len, "\r\n\r\n", cursor);
+                        }
+                        total = trailerEnd + 4;
+                    }
+                    return total - bodyStart <= MaxBody + MaxHead;
+                }
+                if (++chunks > 65536) return false;
+                if (size > MaxBody - payload || cursor + size + 2 < cursor) return false;
+                payload += size;
+                int end = cursor + size + 2;
+                while (len < end)
+                    if (len - bodyStart > MaxBody + MaxHead || !Fill()) return false;
+                if (buf[cursor + size] != '\r' || buf[cursor + size + 1] != '\n') return false;
+                cursor = end;
+            }
         }
 
         bool Fill()
@@ -2744,7 +3326,12 @@ namespace WanGPLauncher
 
         static int Find(byte[] b, int count, string s)
         {
-            for (int i = 0; i + s.Length <= count; i++)
+            return Find(b, count, s, 0);
+        }
+
+        static int Find(byte[] b, int count, string s, int start)
+        {
+            for (int i = start; i + s.Length <= count; i++)
             {
                 int j = 0;
                 while (j < s.Length && b[i + j] == s[j]) j++;

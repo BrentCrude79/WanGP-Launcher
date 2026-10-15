@@ -29,6 +29,17 @@ window you can open from the tray.
   start/stop/restart from the menu.
 - Tray icon colour shows the state: grey stopped, amber starting, green running.
 
+## Sharing the MCP server online (optional)
+
+Choose **Share MCP server online (Cloudflare tunnel)** in the tray menu when a cloud agent needs WanGP. This requires
+`cloudflared`; install it with `winget install --id Cloudflare.cloudflared`. The launcher starts a Cloudflare quick
+tunnel for the MCP port and copies its URL, including a secret path token, to the clipboard. The URL changes every time
+the tunnel starts. Anyone who has the full URL can use WanGP while the tunnel is on, so turn it off as soon as the
+agent is finished.
+
+Cloudflare quick tunnels have no uptime guarantee. Cloudflare also documents that quick tunnels do not support
+Server-Sent Events, so streaming MCP responses may not work through them.
+
 ## Requirements
 
 - Windows 10 or 11 with .NET Framework 4.x (included with Windows).

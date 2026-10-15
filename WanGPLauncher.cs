@@ -626,10 +626,14 @@ namespace WanGPLauncher
         // Updates: "Keep WanGP updated" checks GitHub every few hours and installs new commits whenever WanGP
         // is not in use; "Update WanGP now" does the same at once, but never stops a generation.
         const long UpdateCheckEveryMs = 6 * 3600000L;
+        const long UpdateRetryDelayMs = 15 * 60000L;
         readonly string autoUpdateFile;
         bool autoUpdate, manualUpdate, updateChecking, updateReady, updating, stoppingForUpdate;
         Mode afterUpdate = Mode.None;
-        long lastUpdateCheckAt;
+        long lastUpdateCheckAt, updateRetryAt;
+        bool updatePartial;
+        List<UpdateFile> partialUpdateFiles;
+        HashSet<string> partialLocalFiles;
         long startedAt, lastGuiUseAt, lastMcpUseAt, lastFailAt = -1000000;
         bool onLan; // --listen: the GUI and MCP ports accept LAN connections
         TcpListener guiListener, mcpListener;
@@ -653,6 +657,7 @@ namespace WanGPLauncher
             string launcherDir = Path.Combine(root, "launcher");
             argsFile = Path.Combine(launcherDir, "launcher-args.txt");
             logFile = Path.Combine(launcherDir, "logs", "console.log");
+            log.SetUpdateLogFile(Path.Combine(launcherDir, "logs", "update.log"));
             mcpCache = new McpCache(Path.Combine(launcherDir, "mcp-cache.json"));
             forceMcpFile = Path.Combine(launcherDir, "force-mcp.flag");
             forceMcp = File.Exists(forceMcpFile);
@@ -1036,7 +1041,7 @@ namespace WanGPLauncher
                 int count = -1;
                 string error = null;
                 if (RunTool("git", "fetch --quiet", false, out output) != 0) error = "git fetch failed: " + output;
-                else if (RunTool("git", "rev-list --count HEAD..@{u}", false, out output) != 0 || !int.TryParse(output.Trim(), out count))
+                else if (RunTool("git", "rev-list --count HEAD.." + QuoteArgument("@{u}"), false, out output) != 0 || !int.TryParse(output.Trim(), out count))
                     error = "could not compare with GitHub: " + output;
                 ui.BeginInvoke((MethodInvoker)delegate
                 {
@@ -1078,7 +1083,8 @@ namespace WanGPLauncher
             if (exiting || updating || updateChecking || stoppingForUpdate) return;
             if (autoUpdate && !updateReady && Now - lastUpdateCheckAt > UpdateCheckEveryMs) CheckForUpdate();
             if (!updateReady) return;
-            if (!autoUpdate && !manualUpdate)
+            if (updateRetryAt > Now) return;
+            if (!autoUpdate && !manualUpdate && !updatePartial)
             {
                 updateReady = false; // unticked before it was installed
                 return;
@@ -1101,29 +1107,105 @@ namespace WanGPLauncher
         void BeginUpdate()
         {
             if (updating || proc != null) return;
+            bool resumePartial = updatePartial;
+            List<UpdateFile> resumeFiles = resumePartial && partialUpdateFiles != null ? new List<UpdateFile>(partialUpdateFiles) : null;
+            HashSet<string> resumeLocalFiles = resumePartial && partialLocalFiles != null
+                ? new HashSet<string>(partialLocalFiles, StringComparer.OrdinalIgnoreCase) : null;
             updating = true;
             updateReady = false;
+            updateRetryAt = 0;
             SetState(State.Stopped);
             log.Commit("[update] ===== Updating WanGP " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " =====");
+            bool manualAttempt = manualUpdate;
             var t = new Thread(delegate ()
             {
-                string output, oldHead, newHead, subject, summary = null, error = null;
-                RunTool("git", "rev-parse --short HEAD", false, out oldHead);
-                oldHead = oldHead.Trim();
-                // Fast-forward only: git refuses, and changes nothing, if a local edit or untracked file is in the way.
-                if (RunTool("git", "merge --ff-only @{u}", true, out output) != 0)
-                    error = "git could not fast-forward (a local change is in the way, or the branch has diverged), so WanGP was left as it was.";
-                else
+                string output, oldHead, newHead, subject, summary = null, error = null, oldFullHead = null;
+                List<UpdateFile> files = resumeFiles;
+                HashSet<string> localFiles = resumeLocalFiles;
+                Dictionary<string, FileStamp> before = null;
+                bool partial = resumePartial;
+                if (resumePartial && (files == null || localFiles == null))
+                    error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
+                else if (!resumePartial)
                 {
-                    RunTool("git", "rev-parse --short HEAD", false, out newHead);
-                    RunTool("git", "log -1 --format=%s", false, out subject);
-                    newHead = newHead.Trim();
-                    summary = oldHead + " -> " + newHead + ": " + subject.Trim();
-                    if (oldHead != newHead)
+                    if (!TryCaptureUpdateFiles(out files, out localFiles, out error))
                     {
-                        log.Commit("[update] Installing requirements...");
-                        if (InstallRequirements(out output) != 0)
-                            error = "The code was updated (" + oldHead + " -> " + newHead + "), but installing requirements failed.";
+                        // Keep the ordinary update failure path if Git could not describe the changes.
+                    }
+                    else if (!TryCaptureFileStamps(files, out before, out error))
+                    {
+                        // Do not merge if the baseline could not be recorded safely.
+                    }
+                }
+                if (error == null)
+                {
+                    List<string> inUse = FindInUseFiles(files);
+                    if (inUse.Count > 0)
+                    {
+                        string postponed = PostponedText(inUse);
+                        log.Commit("[update] " + postponed);
+                        ui.BeginInvoke((MethodInvoker)delegate
+                        {
+                            FinishPostponedUpdate(postponed, false, files, localFiles, manualAttempt);
+                        });
+                        return;
+                    }
+
+                    RunTool("git", "rev-parse --short HEAD", false, out oldHead);
+                    oldHead = oldHead.Trim();
+                    if (resumePartial)
+                    {
+                        if (!ReadHead(out oldFullHead, out error) || !CompletePartialUpdate(files, localFiles, out error))
+                        {
+                            if (error == null) error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
+                        }
+                    }
+                    else if (!ReadHead(out oldFullHead, out error))
+                    {
+                        // The snapshot was captured, but the current revision could not be read.
+                    }
+                    // A failed fast-forward can still have replaced some files before Windows refuses one of them.
+                    else if (RunTool("git", "merge --ff-only " + QuoteArgument("@{u}"), true, out output) != 0)
+                    {
+                        string currentHead, headError;
+                        if (ReadHead(out currentHead, out headError) && currentHead == oldFullHead && SnapshotChanged(files, before))
+                        {
+                            partial = true;
+                            log.Commit("[update] git stopped partway through and left WanGP half-updated; completing the update.");
+                            inUse = FindInUseFiles(files);
+                            if (inUse.Count > 0)
+                            {
+                                string postponed = PostponedText(inUse);
+                                log.Commit("[update] " + postponed);
+                                ui.BeginInvoke((MethodInvoker)delegate
+                                {
+                                    FinishPostponedUpdate(postponed, true, files, localFiles, manualAttempt);
+                                });
+                                return;
+                            }
+                            if (!CompletePartialUpdate(files, localFiles, out error) && error == null)
+                                error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
+                        }
+                        else
+                            error = "git could not fast-forward (a local change is in the way, or the branch has diverged), so WanGP was left as it was.";
+                    }
+                    else
+                    {
+                        error = null;
+                    }
+
+                    if (error == null)
+                    {
+                        if (RunTool("git", "rev-parse --short HEAD", false, out newHead) != 0) newHead = oldHead;
+                        newHead = newHead.Trim();
+                        if (RunTool("git", "log -1 --format=%s", false, out subject) != 0) subject = "";
+                        summary = oldHead + " -> " + newHead + ": " + subject.Trim();
+                        if (oldHead != newHead)
+                        {
+                            log.Commit("[update] Installing requirements...");
+                            if (InstallRequirements(out output) != 0)
+                                error = "The code was updated (" + oldHead + " -> " + newHead + "), but installing requirements failed.";
+                        }
                     }
                 }
                 ui.BeginInvoke((MethodInvoker)delegate { FinishUpdate(error, summary); });
@@ -1132,10 +1214,440 @@ namespace WanGPLauncher
             t.Start();
         }
 
+        sealed class UpdateFile
+        {
+            public string Path;
+            public char Status;
+        }
+
+        sealed class FileStamp
+        {
+            public bool Exists;
+            public long Length;
+            public DateTime LastWriteTimeUtc;
+        }
+
+        bool TryCaptureUpdateFiles(out List<UpdateFile> files, out HashSet<string> localFiles, out string error)
+        {
+            files = null;
+            localFiles = null;
+            error = null;
+            string raw, toolError;
+            if (RunToolRaw("git", "diff --name-status --no-renames -z HEAD " + QuoteArgument("@{u}"), out raw, out toolError) != 0)
+            {
+                error = "could not list update files: " + toolError.Trim();
+                return false;
+            }
+            if (!TryParseUpdateFiles(raw, out files))
+            {
+                error = "git returned an invalid update file list; see launcher\\logs\\update.log.";
+                return false;
+            }
+            if (RunToolRaw("git", "diff --name-only -z HEAD", out raw, out toolError) != 0)
+            {
+                error = "could not list local changes: " + toolError.Trim();
+                return false;
+            }
+            if (!TryParseNameOnly(raw, out localFiles))
+            {
+                error = "git returned an invalid local file list; see launcher\\logs\\update.log.";
+                return false;
+            }
+            return true;
+        }
+
+        bool TryParseUpdateFiles(string raw, out List<UpdateFile> files)
+        {
+            files = new List<UpdateFile>();
+            if (raw.Length == 0) return true;
+            string[] parts = raw.Split(new char[] { '\0' });
+            int length = parts.Length;
+            if (length > 0 && parts[length - 1].Length == 0) length--;
+            if (length % 2 != 0) return false;
+            for (int i = 0; i < length; i += 2)
+            {
+                if (parts[i].Length != 1 || "AMDT".IndexOf(parts[i][0]) < 0 || !IsSafeUpdatePath(parts[i + 1])) return false;
+                files.Add(new UpdateFile { Status = parts[i][0], Path = parts[i + 1] });
+            }
+            return true;
+        }
+
+        bool TryParseNameOnly(string raw, out HashSet<string> paths)
+        {
+            paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (raw.Length == 0) return true;
+            string[] parts = raw.Split(new char[] { '\0' });
+            int length = parts.Length;
+            if (length > 0 && parts[length - 1].Length == 0) length--;
+            for (int i = 0; i < length; i++)
+            {
+                if (!IsSafeUpdatePath(parts[i])) return false;
+                paths.Add(parts[i]);
+            }
+            return true;
+        }
+
+        bool IsSafeUpdatePath(string path)
+        {
+            if (String.IsNullOrEmpty(path) || Path.IsPathRooted(path) || path.IndexOf('\\') >= 0 || path.IndexOf(':') >= 0) return false;
+            string[] parts = path.Split('/');
+            char[] invalid = Path.GetInvalidFileNameChars();
+            for (int i = 0; i < parts.Length; i++)
+            {
+                string part = parts[i];
+                if (part.Length == 0 || part == "." || part == ".." || part.EndsWith(".") || part.EndsWith(" ")) return false;
+                if (part.IndexOfAny(invalid) >= 0) return false;
+                string device = part.Split('.')[0].TrimEnd(' ');
+                if (String.Equals(device, "CON", StringComparison.OrdinalIgnoreCase) ||
+                    String.Equals(device, "PRN", StringComparison.OrdinalIgnoreCase) ||
+                    String.Equals(device, "AUX", StringComparison.OrdinalIgnoreCase) ||
+                    String.Equals(device, "NUL", StringComparison.OrdinalIgnoreCase) ||
+                    Regex.IsMatch(device, @"^(COM|LPT)[1-9]$", RegexOptions.IgnoreCase)) return false;
+            }
+            string full;
+            return TryGetUpdateFullPath(path, out full);
+        }
+
+        bool TryGetUpdateFullPath(string path, out string full)
+        {
+            full = null;
+            try
+            {
+                string basePath = Path.GetFullPath(root);
+                if (!basePath.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal) &&
+                    !basePath.EndsWith(Path.AltDirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+                    basePath += Path.DirectorySeparatorChar;
+                full = Path.GetFullPath(Path.Combine(basePath, path.Replace('/', Path.DirectorySeparatorChar)));
+                return full.StartsWith(basePath, StringComparison.OrdinalIgnoreCase);
+            }
+            catch (Exception) { return false; }
+        }
+
+        bool TryCaptureFileStamps(List<UpdateFile> files, out Dictionary<string, FileStamp> stamps, out string error)
+        {
+            stamps = new Dictionary<string, FileStamp>(StringComparer.OrdinalIgnoreCase);
+            error = null;
+            try
+            {
+                foreach (UpdateFile file in files)
+                {
+                    string full;
+                    if (!TryGetUpdateFullPath(file.Path, out full))
+                    {
+                        error = "could not safely resolve an update path; see launcher\\logs\\update.log.";
+                        return false;
+                    }
+                    stamps[file.Path] = ReadFileStamp(full);
+                }
+                return true;
+            }
+            catch (Exception e)
+            {
+                error = "could not snapshot update files: " + e.Message;
+                return false;
+            }
+        }
+
+        FileStamp ReadFileStamp(string full)
+        {
+            var stamp = new FileStamp();
+            if (File.Exists(full))
+            {
+                var info = new FileInfo(full);
+                stamp.Exists = true;
+                stamp.Length = info.Length;
+                stamp.LastWriteTimeUtc = info.LastWriteTimeUtc;
+            }
+            return stamp;
+        }
+
+        bool SnapshotChanged(List<UpdateFile> files, Dictionary<string, FileStamp> before)
+        {
+            if (before == null) return true;
+            foreach (UpdateFile file in files)
+            {
+                string full;
+                if (!TryGetUpdateFullPath(file.Path, out full)) return true;
+                FileStamp oldStamp;
+                if (!before.TryGetValue(file.Path, out oldStamp)) return true;
+                try
+                {
+                    FileStamp newStamp = ReadFileStamp(full);
+                    if (oldStamp.Exists != newStamp.Exists || oldStamp.Length != newStamp.Length ||
+                        oldStamp.LastWriteTimeUtc != newStamp.LastWriteTimeUtc) return true;
+                }
+                catch (Exception) { return true; }
+            }
+            return false;
+        }
+
+        List<string> FindInUseFiles(List<UpdateFile> files)
+        {
+            var inUse = new List<string>();
+            foreach (UpdateFile file in files)
+            {
+                string full;
+                if (!TryGetUpdateFullPath(file.Path, out full) || !File.Exists(full)) continue;
+                try
+                {
+                    if ((File.GetAttributes(full) & FileAttributes.ReadOnly) != 0) continue;
+                    using (var stream = new FileStream(full, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+                }
+                catch (IOException) { inUse.Add(file.Path); }
+                catch (UnauthorizedAccessException) { inUse.Add(file.Path); }
+            }
+            return inUse;
+        }
+
+        string PostponedText(List<string> inUse)
+        {
+            return "Postponed: " + inUse.Count + " file" + (inUse.Count == 1 ? "" : "s") +
+                " the update replaces are in use by another program (e.g. " + DisplayUpdatePath(inUse[0]) + "). Retrying in 15 minutes.";
+        }
+
+        string DisplayUpdatePath(string path)
+        {
+            var text = new StringBuilder();
+            foreach (char c in path)
+            {
+                if (c < 32 || c == 127) text.Append("\\u").Append(((int)c).ToString("x4", CultureInfo.InvariantCulture));
+                else text.Append(c);
+            }
+            return text.ToString();
+        }
+
+        bool ReadHead(out string head, out string error)
+        {
+            string output;
+            int result = RunTool("git", "rev-parse HEAD", false, out output);
+            head = output.Trim();
+            error = result == 0 && head.Length > 0 ? null : "could not read the current Git revision: " + output.Trim();
+            return error == null;
+        }
+
+        bool CompletePartialUpdate(List<UpdateFile> files, HashSet<string> localFiles, out string error)
+        {
+            error = null;
+            string output;
+            if (RunTool("git", "reset --mixed " + QuoteArgument("@{u}"), true, out output) != 0)
+            {
+                log.Commit("[update] Could not reset the index to GitHub: " + output.Trim());
+                LogPartialRepair(localFiles, null, "git reset failed");
+                error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
+                return false;
+            }
+
+            var checkoutFiles = new List<string>();
+            foreach (UpdateFile file in files)
+                if (file.Status != 'D' && !localFiles.Contains(file.Path)) checkoutFiles.Add(file.Path);
+            if (checkoutFiles.Count > 0)
+            {
+                string tempFile = Path.Combine(Path.GetTempPath(), "wangp-update-" + Guid.NewGuid().ToString("N") + ".paths");
+                try
+                {
+                    var pathspecs = new StringBuilder();
+                    foreach (string path in checkoutFiles) pathspecs.Append(":(literal)").Append(path).Append('\0');
+                    File.WriteAllText(tempFile, pathspecs.ToString(), new UTF8Encoding(false));
+                    string args = "checkout " + QuoteArgument("@{u}") + " --pathspec-from-file=" + QuoteArgument(tempFile) + " --pathspec-file-nul";
+                    if (RunTool("git", args, true, out output) != 0)
+                        log.Commit("[update] Could not check out all update files: " + output.Trim());
+                }
+                catch (Exception e)
+                {
+                    log.Commit("[update] Could not prepare the update path list: " + e.Message);
+                }
+                finally
+                {
+                    try { if (File.Exists(tempFile)) File.Delete(tempFile); }
+                    catch (Exception e) { log.Commit("[update] Could not remove the temporary path list: " + e.Message); }
+                }
+            }
+
+            foreach (UpdateFile file in files)
+            {
+                if (file.Status != 'D' || localFiles.Contains(file.Path)) continue;
+                string full;
+                if (!TryGetUpdateFullPath(file.Path, out full))
+                {
+                    log.Commit("[update] Could not safely resolve deleted update path " + DisplayUpdatePath(file.Path) + ".");
+                    continue;
+                }
+                try { if (File.Exists(full)) File.Delete(full); }
+                catch (Exception e) { log.Commit("[update] Could not remove deleted update path " + DisplayUpdatePath(file.Path) + ": " + e.Message); }
+            }
+
+            string currentHead, upstreamHead, headError;
+            bool headRead = ReadHead(out currentHead, out headError);
+            int upstreamResult = RunTool("git", "rev-parse " + QuoteArgument("@{u}"), false, out upstreamHead);
+            upstreamHead = upstreamHead.Trim();
+            HashSet<string> leftovers;
+            string diffError;
+            bool diffRead = ReadLeftoverPaths(localFiles, out leftovers, out diffError);
+            bool verified = headRead && upstreamResult == 0 && currentHead == upstreamHead && diffRead && leftovers.Count == 0;
+            if (!verified)
+            {
+                string reason = !headRead ? headError : upstreamResult != 0 ? "could not read the upstream revision" :
+                    currentHead != upstreamHead ? "HEAD does not match the upstream revision" : !diffRead ? diffError : "update files remain different from HEAD";
+                LogPartialRepair(localFiles, diffRead ? leftovers : null, reason);
+                error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
+                return false;
+            }
+            return true;
+        }
+
+        bool ReadLeftoverPaths(HashSet<string> localFiles, out HashSet<string> leftovers, out string error)
+        {
+            leftovers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            error = null;
+            string output, toolError;
+            if (RunToolRaw("git", "diff --name-only -z HEAD", out output, out toolError) != 0)
+            {
+                error = "could not verify local changes: " + toolError.Trim();
+                return false;
+            }
+            HashSet<string> changed;
+            if (!TryParseNameOnly(output, out changed))
+            {
+                error = "git returned an invalid verification file list";
+                return false;
+            }
+            foreach (string path in changed)
+                if (!localFiles.Contains(path)) leftovers.Add(path);
+            return true;
+        }
+
+        void LogPartialRepair(HashSet<string> localFiles, HashSet<string> leftovers, string reason)
+        {
+            log.Commit("[update] Automatic completion could not verify the update: " + reason + ".");
+            if (leftovers == null)
+            {
+                string error;
+                HashSet<string> found;
+                if (localFiles != null && ReadLeftoverPaths(localFiles, out found, out error)) leftovers = found;
+            }
+            if (leftovers == null) log.Commit("[update] Leftover paths could not be listed.");
+            else if (leftovers.Count == 0) log.Commit("[update] Leftover paths: none.");
+            else
+            {
+                int shown = 0;
+                foreach (string path in leftovers)
+                {
+                    if (shown++ == 20) break;
+                    log.Commit("[update] Leftover path: " + DisplayUpdatePath(path));
+                }
+                if (leftovers.Count > 20) log.Commit("[update] " + (leftovers.Count - 20) + " more leftover path(s) not shown.");
+            }
+            log.Commit("[update] Manual repair in the WanGP folder:");
+            log.Commit("[update]   git reset --mixed \"@{u}\"");
+            if (leftovers != null && leftovers.Count > 0)
+            {
+                int shown = 0;
+                foreach (string path in leftovers)
+                {
+                    if (shown++ == 20) break;
+                    string literalPath = ":(literal)" + path;
+                    log.Commit("[update]   git checkout \"@{u}\" -- " + PowerShellQuote(literalPath));
+                }
+            }
+            else log.Commit("[update]   For each leftover path, run git checkout \"@{u}\" -- '<path>'.");
+        }
+
+        string PowerShellQuote(string value)
+        {
+            return "'" + value.Replace("'", "''") + "'";
+        }
+
+        void FinishPostponedUpdate(string message, bool partial, List<UpdateFile> files, HashSet<string> localFiles, bool manualAttempt)
+        {
+            updating = false;
+            updateReady = true;
+            updateRetryAt = Now + UpdateRetryDelayMs;
+            updatePartial = partial;
+            partialUpdateFiles = partial ? new List<UpdateFile>(files) : null;
+            partialLocalFiles = partial ? new HashSet<string>(localFiles, StringComparer.OrdinalIgnoreCase) : null;
+            lastUpdateCheckAt = Now;
+            Mode m = forceMcp ? Mode.Mcp : afterUpdate;
+            afterUpdate = Mode.None;
+            SetState(State.Stopped);
+            if (manualAttempt) ShowBalloon("WanGP update postponed", message, ToolTipIcon.Warning, ShowLog);
+            // A half-updated WanGP would only crash or hold the files open again, so wait for the retry instead.
+            if (!exiting && !partial && m != Mode.None) Start(m, false);
+        }
+
+        string QuoteArgument(string value)
+        {
+            var quoted = new StringBuilder();
+            quoted.Append('"');
+            int slashes = 0;
+            foreach (char c in value)
+            {
+                if (c == '\\') { slashes++; continue; }
+                if (c == '"')
+                {
+                    quoted.Append('\\', slashes * 2 + 1).Append('"');
+                    slashes = 0;
+                    continue;
+                }
+                if (slashes > 0) { quoted.Append('\\', slashes); slashes = 0; }
+                quoted.Append(c);
+            }
+            if (slashes > 0) quoted.Append('\\', slashes * 2);
+            quoted.Append('"');
+            return quoted.ToString();
+        }
+
+        int RunToolRaw(string exe, string args, out string output, out string errorOutput)
+        {
+            output = "";
+            errorOutput = "";
+            var psi = new ProcessStartInfo(exe, args);
+            psi.WorkingDirectory = root;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardInput = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.StandardOutputEncoding = new UTF8Encoding(false);
+            psi.StandardErrorEncoding = new UTF8Encoding(false);
+            psi.EnvironmentVariables["GIT_TERMINAL_PROMPT"] = "0";
+            psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+            try
+            {
+                using (var p = new Process())
+                {
+                    p.StartInfo = psi;
+                    p.Start();
+                    p.StandardInput.Close();
+                    string rawOutput = "", rawError = "";
+                    var stdout = new Thread(delegate () { rawOutput = p.StandardOutput.ReadToEnd(); });
+                    var stderr = new Thread(delegate () { rawError = p.StandardError.ReadToEnd(); });
+                    stdout.IsBackground = true;
+                    stderr.IsBackground = true;
+                    stdout.Start();
+                    stderr.Start();
+                    p.WaitForExit();
+                    stdout.Join();
+                    stderr.Join();
+                    output = rawOutput;
+                    errorOutput = rawError;
+                    return p.ExitCode;
+                }
+            }
+            catch (Exception e)
+            {
+                errorOutput = e.Message;
+                return -1;
+            }
+        }
+
         void FinishUpdate(string error, string summary)
         {
             updating = false;
             manualUpdate = false;
+            updatePartial = false;
+            partialUpdateFiles = null;
+            partialLocalFiles = null;
+            updateRetryAt = 0;
             lastUpdateCheckAt = Now;
             if (error != null)
             {
@@ -1175,6 +1687,7 @@ namespace WanGPLauncher
             psi.WorkingDirectory = root;
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
+            psi.RedirectStandardInput = true;
             psi.RedirectStandardOutput = true;
             psi.RedirectStandardError = true;
             psi.StandardOutputEncoding = new UTF8Encoding(false);
@@ -1195,6 +1708,7 @@ namespace WanGPLauncher
                     p.OutputDataReceived += onLine;
                     p.ErrorDataReceived += onLine;
                     p.Start();
+                    p.StandardInput.Close();
                     p.BeginOutputReadLine();
                     p.BeginErrorReadLine();
                     p.WaitForExit();
@@ -2335,15 +2849,23 @@ namespace WanGPLauncher
     sealed class LogBuffer
     {
         const int MaxLines = 5000;
+        const long MaxUpdateLogBytes = 2 * 1024 * 1024L;
         static readonly Regex Ansi = new Regex(@"\x1B(\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1B]*(\x07|\x1B\\)|[@-Z\\-_])", RegexOptions.Compiled);
         readonly object sync = new object();
+        readonly object updateLogLock = new object();
         readonly List<string> lines = new List<string>();
         readonly string[] live = { "", "" };
+        string updateLogPath;
         long firstSeq;
         StreamWriter file;
         int version;
 
         public int Version { get { return Thread.VolatileRead(ref version); } }
+
+        public void SetUpdateLogFile(string path)
+        {
+            updateLogPath = path;
+        }
 
         public long End { get { lock (sync) return firstSeq + lines.Count; } }
 
@@ -2396,7 +2918,39 @@ namespace WanGPLauncher
                     try { file.WriteLine(line); } catch (Exception) { }
                 }
             }
+            if (line.StartsWith("[update]", StringComparison.Ordinal)) AppendUpdateLog(line);
             Interlocked.Increment(ref version);
+        }
+
+        void AppendUpdateLog(string line)
+        {
+            string path = updateLogPath;
+            if (String.IsNullOrEmpty(path)) return;
+            lock (updateLogLock)
+            {
+                try
+                {
+                    string dir = Path.GetDirectoryName(path);
+                    Directory.CreateDirectory(dir);
+                    if (File.Exists(path) && new FileInfo(path).Length > MaxUpdateLogBytes)
+                    {
+                        string previous = Path.Combine(dir, "update.prev.log");
+                        try
+                        {
+                            if (File.Exists(previous)) File.Delete(previous);
+                            File.Move(path, previous);
+                        }
+                        catch (Exception) { }
+                    }
+                    string normalized = line.Replace("\r\n", "\n").Replace('\r', '\n');
+                    string[] parts = normalized.Split(new char[] { '\n' });
+                    var contents = new StringBuilder();
+                    foreach (string part in parts)
+                        contents.Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)).Append(' ').Append(part).Append(Environment.NewLine);
+                    File.AppendAllText(path, contents.ToString(), new UTF8Encoding(false));
+                }
+                catch (Exception) { }
+            }
         }
 
         public void SetLive(int stream, string text)

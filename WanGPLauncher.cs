@@ -630,14 +630,19 @@ namespace WanGPLauncher
         // Updates: "Keep WanGP updated" checks GitHub every few hours and installs new commits whenever WanGP
         // is not in use; "Update WanGP now" does the same at once, but never stops a generation.
         const long UpdateCheckEveryMs = 6 * 3600000L;
-        const long UpdateRetryDelayMs = 15 * 60000L;
+        const long UpdateRetryBaseDelayMs = 15 * 60000L;
+        const long UpdateRetryMaxDelayMs = 120 * 60000L;
         readonly string autoUpdateFile;
+        readonly string updatePartialFile;
         bool autoUpdate, manualUpdate, updateChecking, updateReady, updating, stoppingForUpdate;
         Mode afterUpdate = Mode.None;
         long lastUpdateCheckAt, updateRetryAt;
         bool updatePartial;
         List<UpdateFile> partialUpdateFiles;
         HashSet<string> partialLocalFiles;
+        string partialPinnedSha, partialOldHead, firstInUsePath;
+        int updateFailureCount;
+        bool updateRetryWarningShown, updateRepairRequired;
         long startedAt, lastGuiUseAt, lastMcpUseAt, lastFailAt = -1000000;
         bool onLan; // --listen: the GUI and MCP ports accept LAN connections
         TcpListener guiListener, mcpListener;
@@ -673,7 +678,9 @@ namespace WanGPLauncher
             forceMcpFile = Path.Combine(launcherDir, "force-mcp.flag");
             forceMcp = File.Exists(forceMcpFile);
             autoUpdateFile = Path.Combine(launcherDir, "auto-update.flag");
+            updatePartialFile = Path.Combine(launcherDir, "update-partial.json");
             autoUpdate = File.Exists(autoUpdateFile);
+            LoadPartialUpdateState();
             lastUpdateCheckAt = Now - UpdateCheckEveryMs + 120000; // first check two minutes after the tray starts
             string startArgs = UserArgs();
             port = ParsePort(startArgs);
@@ -911,7 +918,9 @@ namespace WanGPLauncher
         Avail RequestMode(Mode m)
         {
             if (exiting) return Avail.Failed;
-            if (updating || stoppingForUpdate || (updateReady && proc == null && !stopping))
+            if (updateRepairRequired) return Avail.Failed;
+            if (updatePartial && (!updateReady || updateRetryAt > Now)) return Avail.Busy;
+            if (updating || stoppingForUpdate || (updateReady && updateRetryAt <= Now && proc == null && !stopping))
             {
                 if (forceMcp && m != Mode.Mcp) return Avail.Busy;
                 afterUpdate = m; // start in this mode once the update is installed
@@ -1006,7 +1015,7 @@ namespace WanGPLauncher
         void KeepMcp()
         {
             if (!forceMcp || exiting) return;
-            if (updating || stoppingForUpdate) return; // the update restarts MCP mode when it is done
+            if (updating || stoppingForUpdate || updatePartial || updateRepairRequired) return; // updates restart MCP mode when safe
             if (stopping)
             {
                 if (proc != null) nextMode = Mode.Mcp; // whatever stop is under way, come back as MCP
@@ -1040,12 +1049,23 @@ namespace WanGPLauncher
             log.Commit(on ? "[update] Keep WanGP updated: on. The tray checks GitHub every " + UpdateCheckEveryMs / 3600000 +
                 " hours and installs updates while WanGP is not in use; it never stops a generation."
                 : "[update] Keep WanGP updated: off.");
-            if (on) CheckForUpdate();
+            if (on && !updateReady && !updatePartial) CheckForUpdate();
         }
 
         void UpdateNow()
         {
-            if (updating || manualUpdate) return;
+            if (updatePartial && !updating && !updateReady && updateRetryAt <= Now)
+            {
+                updateReady = true;
+                log.Commit("[update] Retrying completion of the saved partial update; no fetch is needed.");
+                MaybeUpdate();
+                return;
+            }
+            if (updating || manualUpdate || updatePartial || (updateReady && updateRetryAt > Now))
+            {
+                log.Commit("[update] An update is already pending; it will retry when allowed.");
+                return;
+            }
             manualUpdate = true;
             log.Commit("[update] Checking GitHub for WanGP updates...");
             if (updateReady) log.Commit("[update] An update is already waiting; installing it as soon as WanGP is not generating.");
@@ -1055,7 +1075,7 @@ namespace WanGPLauncher
         // Fetches from GitHub in the background (harmless while WanGP runs) and counts the new commits.
         void CheckForUpdate()
         {
-            if (updateChecking || updating) return;
+            if (updateChecking || updating || updateReady || updatePartial || updateRepairRequired) return;
             updateChecking = true;
             lastUpdateCheckAt = Now;
             var t = new Thread(delegate ()
@@ -1103,11 +1123,11 @@ namespace WanGPLauncher
         // Called by the UI timer: checks on schedule, and installs a found update at a safe moment.
         void MaybeUpdate()
         {
-            if (exiting || updating || updateChecking || stoppingForUpdate) return;
+            if (exiting || updateRepairRequired || updating || updateChecking || stoppingForUpdate) return;
             if (autoUpdate && !updateReady && Now - lastUpdateCheckAt > UpdateCheckEveryMs) CheckForUpdate();
             if (!updateReady) return;
             if (updateRetryAt > Now) return;
-            if (!autoUpdate && !manualUpdate && !updatePartial)
+            if (!autoUpdate && !manualUpdate && !updatePartial && updateRetryAt == 0)
             {
                 updateReady = false; // unticked before it was installed
                 return;
@@ -1134,6 +1154,11 @@ namespace WanGPLauncher
             List<UpdateFile> resumeFiles = resumePartial && partialUpdateFiles != null ? new List<UpdateFile>(partialUpdateFiles) : null;
             HashSet<string> resumeLocalFiles = resumePartial && partialLocalFiles != null
                 ? new HashSet<string>(partialLocalFiles, StringComparer.OrdinalIgnoreCase) : null;
+            string resumePinnedSha = resumePartial ? partialPinnedSha : null;
+            string resumeOldHead = resumePartial ? partialOldHead : null;
+            int failureCount = updateFailureCount;
+            bool warningShown = updateRetryWarningShown;
+            string firstPath = firstInUsePath;
             updating = true;
             updateReady = false;
             updateRetryAt = 0;
@@ -1142,16 +1167,24 @@ namespace WanGPLauncher
             bool manualAttempt = manualUpdate;
             var t = new Thread(delegate ()
             {
-                string output, oldHead, newHead, subject, summary = null, error = null, oldFullHead = null;
+                string output = "", subject = "", summary = null, error = null;
                 List<UpdateFile> files = resumeFiles;
                 HashSet<string> localFiles = resumeLocalFiles;
                 Dictionary<string, FileStamp> before = null;
                 bool partial = resumePartial;
+                bool partialRetry = false, partialAbandoned = false, partialFailure = false;
+                bool recoveryStateSaved = resumePartial;
+                string pinnedSha = resumePinnedSha, oldFullHead = resumeOldHead;
+                string postponed = null;
                 if (resumePartial && (files == null || localFiles == null))
+                {
                     error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
+                    partialAbandoned = true;
+                    LogPartialRepair(localFiles, null, pinnedSha, "saved update state is incomplete");
+                }
                 else if (!resumePartial)
                 {
-                    if (!TryCaptureUpdateFiles(out files, out localFiles, out error))
+                    if (!TryCaptureUpdateFiles(out files, out localFiles, out pinnedSha, out oldFullHead, out error))
                     {
                         // Keep the ordinary update failure path if Git could not describe the changes.
                     }
@@ -1162,74 +1195,191 @@ namespace WanGPLauncher
                 }
                 if (error == null)
                 {
-                    List<string> inUse = FindInUseFiles(files);
-                    if (inUse.Count > 0)
+                    string currentHead, headError;
+                    if (resumePartial && (!ReadHead(out currentHead, out headError) ||
+                        (currentHead != oldFullHead && currentHead != pinnedSha)))
                     {
-                        string postponed = PostponedText(inUse);
+                        partialAbandoned = true;
+                        error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
+                        LogPartialRepair(localFiles, null, pinnedSha, headError == null ? "HEAD changed since the partial update" : headError);
+                    }
+                    string inUseError = null;
+                    List<string> inUse = partialAbandoned ? new List<string>() : FindInUseFiles(files, out inUseError);
+                    if (!partialAbandoned && inUseError != null)
+                    {
+                        error = inUseError;
+                        partialFailure = resumePartial;
+                    }
+                    else if (!partialAbandoned && inUse.Count > 0)
+                    {
+                        postponed = PostponedText(inUse, failureCount + 1);
                         log.Commit("[update] " + postponed);
                         ui.BeginInvoke((MethodInvoker)delegate
                         {
-                            FinishPostponedUpdate(postponed, false, files, localFiles, manualAttempt);
+                            FinishPostponedUpdate(postponed, resumePartial, files, localFiles, pinnedSha, oldFullHead,
+                                firstPath ?? inUse[0], manualAttempt);
                         });
                         return;
                     }
 
-                    RunTool("git", "rev-parse --short HEAD", false, out oldHead);
-                    oldHead = oldHead.Trim();
-                    if (resumePartial)
+                    if (error == null && !partialAbandoned && resumePartial)
                     {
-                        if (!ReadHead(out oldFullHead, out error) || !CompletePartialUpdate(files, localFiles, out error))
+                        bool resetSucceeded, abandoned;
+                        if (!CompletePartialUpdate(files, localFiles, oldFullHead, pinnedSha, failureCount, warningShown, firstPath,
+                            out error, out resetSucceeded, out abandoned))
                         {
-                            if (error == null) error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
-                        }
-                    }
-                    else if (!ReadHead(out oldFullHead, out error))
-                    {
-                        // The snapshot was captured, but the current revision could not be read.
-                    }
-                    // A failed fast-forward can still have replaced some files before Windows refuses one of them.
-                    else if (RunTool("git", "merge --ff-only " + QuoteArgument("@{u}"), true, out output) != 0)
-                    {
-                        string currentHead, headError;
-                        if (ReadHead(out currentHead, out headError) && currentHead == oldFullHead && SnapshotChanged(files, before))
-                        {
-                            partial = true;
-                            log.Commit("[update] git stopped partway through and left WanGP half-updated; completing the update.");
-                            inUse = FindInUseFiles(files);
-                            if (inUse.Count > 0)
-                            {
-                                string postponed = PostponedText(inUse);
-                                log.Commit("[update] " + postponed);
-                                ui.BeginInvoke((MethodInvoker)delegate
-                                {
-                                    FinishPostponedUpdate(postponed, true, files, localFiles, manualAttempt);
-                                });
-                                return;
-                            }
-                            if (!CompletePartialUpdate(files, localFiles, out error) && error == null)
-                                error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
+                            if (abandoned) partialAbandoned = true;
+                            else if (IsUpdateAccessDenied(error)) { partialFailure = true; partial = true; }
+                            else { partialRetry = true; partial = true; }
                         }
                         else
-                            error = "git could not fast-forward (a local change is in the way, or the branch has diverged), so WanGP was left as it was.";
+                        {
+                            partial = false;
+                            DeletePartialUpdateState();
+                            recoveryStateSaved = false;
+                        }
                     }
-                    else
+                    else if (error == null && !partialAbandoned)
                     {
-                        error = null;
+                        if (!ReadHead(out currentHead, out headError) || currentHead != oldFullHead)
+                            error = headError == null ? "HEAD changed while the update was being prepared." : headError;
+                        else
+                        {
+                            string stateError;
+                            if (!SavePartialUpdateState(pinnedSha, oldFullHead, files, localFiles, failureCount, warningShown,
+                                firstPath, DateTime.MinValue, out stateError))
+                                error = "Could not save update recovery state: " + stateError;
+                            else recoveryStateSaved = true;
+                        }
+
+                        if (error == null)
+                        {
+                            int mergeResult = RunTool("git", "merge --ff-only " + QuoteArgument(pinnedSha), true, out output);
+                            if (mergeResult == 0)
+                            {
+                                if (!ReadHead(out currentHead, out headError) || currentHead != pinnedSha)
+                                {
+                                    error = headError == null ? "Git did not move HEAD to the pinned update revision." : headError;
+                                    partialRetry = true;
+                                    partial = true;
+                                }
+                                else
+                                {
+                                    DeletePartialUpdateState();
+                                    recoveryStateSaved = false;
+                                }
+                            }
+                            else if (ReadHead(out currentHead, out headError) &&
+                                ((currentHead == oldFullHead && SnapshotChanged(files, before)) || currentHead == pinnedSha))
+                            {
+                                partial = true;
+                                log.Commit("[update] git stopped partway through and left WanGP half-updated; completing the update.");
+                                inUse = FindInUseFiles(files, out inUseError);
+                                if (inUseError != null)
+                                {
+                                    error = inUseError;
+                                    partialFailure = true;
+                                }
+                                else if (inUse.Count > 0)
+                                {
+                                    postponed = PostponedText(inUse, failureCount + 1);
+                                    log.Commit("[update] " + postponed);
+                                    ui.BeginInvoke((MethodInvoker)delegate
+                                    {
+                                        FinishPostponedUpdate(postponed, true, files, localFiles, pinnedSha, oldFullHead,
+                                            firstPath ?? inUse[0], manualAttempt);
+                                    });
+                                    return;
+                                }
+                                else
+                                {
+                                    bool resetSucceeded, abandoned;
+                                    if (!CompletePartialUpdate(files, localFiles, oldFullHead, pinnedSha, failureCount, warningShown, firstPath,
+                                        out error, out resetSucceeded, out abandoned))
+                                    {
+                                        if (abandoned) partialAbandoned = true;
+                                        else if (IsUpdateAccessDenied(error)) { partialFailure = true; partial = true; }
+                                        else { partialRetry = true; partial = true; }
+                                    }
+                                    else
+                                    {
+                                        partial = false;
+                                        DeletePartialUpdateState();
+                                        recoveryStateSaved = false;
+                                    }
+                                }
+                            }
+                            else if (headError != null)
+                            {
+                                error = "Could not verify the current revision after Git refused the update; automatic completion will retry.";
+                                partialRetry = true;
+                                partial = true;
+                            }
+                            else if (currentHead != oldFullHead && currentHead != pinnedSha)
+                            {
+                                LogPartialRepair(localFiles, null, pinnedSha, "HEAD changed while the update was running");
+                                error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
+                                partialAbandoned = true;
+                            }
+                            else
+                            {
+                                DeletePartialUpdateState();
+                                recoveryStateSaved = false;
+                                error = "git could not fast-forward (a local change is in the way, or the branch has diverged), so WanGP was left as it was.";
+                            }
+                        }
                     }
 
                     if (error == null)
                     {
-                        if (RunTool("git", "rev-parse --short HEAD", false, out newHead) != 0) newHead = oldHead;
-                        newHead = newHead.Trim();
+                        string oldShort = oldFullHead.Substring(0, 7), newShort = pinnedSha.Substring(0, 7);
                         if (RunTool("git", "log -1 --format=%s", false, out subject) != 0) subject = "";
-                        summary = oldHead + " -> " + newHead + ": " + subject.Trim();
-                        if (oldHead != newHead)
+                        summary = oldShort + " -> " + newShort + ": " + subject.Trim();
+                        if (oldFullHead != pinnedSha)
                         {
                             log.Commit("[update] Installing requirements...");
                             if (InstallRequirements(out output) != 0)
-                                error = "The code was updated (" + oldHead + " -> " + newHead + "), but installing requirements failed.";
+                                error = "The code was updated (" + oldShort + " -> " + newShort + "), but installing requirements failed.";
                         }
                     }
+                }
+                if (partialAbandoned)
+                {
+                    DeletePartialUpdateState();
+                    ui.BeginInvoke((MethodInvoker)delegate { FinishAbandonedPartialUpdate(error); });
+                    return;
+                }
+                if (partialFailure)
+                {
+                    ui.BeginInvoke((MethodInvoker)delegate
+                    {
+                        FinishPartialUpdateFailure(error, files, localFiles, pinnedSha, oldFullHead, firstPath);
+                    });
+                    return;
+                }
+                if (partialRetry)
+                {
+                if (!String.IsNullOrEmpty(error)) log.Commit("[update] " + error);
+                    string message = "Automatic completion could not finish; retrying in " + RetryDelayMinutes(failureCount + 1) +
+                        " minutes. See launcher\\logs\\update.log.";
+                    log.Commit("[update] " + message);
+                    ui.BeginInvoke((MethodInvoker)delegate
+                    {
+                        FinishPostponedUpdate(message, true, files, localFiles, pinnedSha, oldFullHead, firstPath, manualAttempt);
+                    });
+                    return;
+                }
+                if (recoveryStateSaved && error != null)
+                {
+                log.Commit("[update] " + error);
+                    string message = "Automatic completion could not finish; retrying in " + RetryDelayMinutes(failureCount + 1) +
+                        " minutes. See launcher\\logs\\update.log.";
+                    log.Commit("[update] " + message);
+                    ui.BeginInvoke((MethodInvoker)delegate
+                    {
+                        FinishPostponedUpdate(message, true, files, localFiles, pinnedSha, oldFullHead, firstPath, manualAttempt);
+                    });
+                    return;
                 }
                 ui.BeginInvoke((MethodInvoker)delegate { FinishUpdate(error, summary); });
             });
@@ -1250,13 +1400,189 @@ namespace WanGPLauncher
             public DateTime LastWriteTimeUtc;
         }
 
-        bool TryCaptureUpdateFiles(out List<UpdateFile> files, out HashSet<string> localFiles, out string error)
+        public sealed class SavedUpdateFile
+        {
+            public string Path { get; set; }
+            public string Status { get; set; }
+        }
+
+        public sealed class SavedPartialUpdate
+        {
+            public int Version { get; set; }
+            public string PinnedSha { get; set; }
+            public string OldHead { get; set; }
+            public string[] LocalFiles { get; set; }
+            public SavedUpdateFile[] Files { get; set; }
+            public int FailureCount { get; set; }
+            public bool WarningShown { get; set; }
+            public string FirstInUsePath { get; set; }
+            public long RetryAtUtcTicks { get; set; }
+        }
+
+        bool IsGitSha(string value)
+        {
+            return !String.IsNullOrEmpty(value) && Regex.IsMatch(value, "^[0-9a-fA-F]{40}$");
+        }
+
+        bool IsUpdateAccessDenied(string error)
+        {
+            return !String.IsNullOrEmpty(error) && error.StartsWith("cannot write ", StringComparison.OrdinalIgnoreCase) &&
+                error.EndsWith(": access denied", StringComparison.OrdinalIgnoreCase);
+        }
+
+        void LoadPartialUpdateState()
+        {
+            if (!File.Exists(updatePartialFile)) return;
+            try
+            {
+                var info = new FileInfo(updatePartialFile);
+                if (info.Length <= 0 || info.Length > 4 * 1024 * 1024) throw new InvalidDataException("invalid state file size");
+                var serializer = new JavaScriptSerializer();
+                serializer.MaxJsonLength = 4 * 1024 * 1024;
+                SavedPartialUpdate saved = serializer.Deserialize<SavedPartialUpdate>(File.ReadAllText(updatePartialFile, Encoding.UTF8));
+                if (saved == null || saved.Version != 1 || !IsGitSha(saved.PinnedSha) || !IsGitSha(saved.OldHead) ||
+                    saved.Files == null || saved.LocalFiles == null || saved.Files.Length > 100000 || saved.LocalFiles.Length > 100000 ||
+                    saved.FailureCount < 0 || saved.FailureCount > 100000 || saved.RetryAtUtcTicks < 0 || saved.RetryAtUtcTicks > DateTime.MaxValue.Ticks)
+                    throw new InvalidDataException("invalid state fields");
+                var files = new List<UpdateFile>();
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (SavedUpdateFile item in saved.Files)
+                {
+                    if (item == null || !IsSafeUpdatePath(item.Path) || item.Status == null || item.Status.Length != 1 ||
+                        "AMDT".IndexOf(item.Status[0]) < 0 || !seen.Add(item.Path))
+                        throw new InvalidDataException("invalid update file path");
+                    files.Add(new UpdateFile { Path = item.Path, Status = item.Status[0] });
+                }
+                var localFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (string path in saved.LocalFiles)
+                {
+                    if (!IsSafeUpdatePath(path) || !localFiles.Add(path)) throw new InvalidDataException("invalid local file path");
+                }
+                if (!String.IsNullOrEmpty(saved.FirstInUsePath) && !IsSafeUpdatePath(saved.FirstInUsePath))
+                    throw new InvalidDataException("invalid postponed path");
+
+                partialUpdateFiles = files;
+                partialLocalFiles = localFiles;
+                partialPinnedSha = saved.PinnedSha.ToLowerInvariant();
+                partialOldHead = saved.OldHead.ToLowerInvariant();
+                updateFailureCount = saved.FailureCount;
+                updateRetryWarningShown = saved.WarningShown;
+                firstInUsePath = saved.FirstInUsePath;
+                updatePartial = true;
+                updateReady = true;
+                if (saved.RetryAtUtcTicks > 0)
+                {
+                    long remaining = Math.Max(0, (new DateTime(saved.RetryAtUtcTicks, DateTimeKind.Utc) - DateTime.UtcNow).Ticks / TimeSpan.TicksPerMillisecond);
+                    updateRetryAt = Now + remaining;
+                }
+                log.Commit("[update] Resuming a saved partial update to " + partialPinnedSha + ".");
+            }
+            catch (Exception e)
+            {
+                DeletePartialUpdateState();
+                updateRepairRequired = true;
+                log.Commit("[update] Saved partial update state is invalid and was removed: " + e.Message);
+                log.Commit("[update] Manual repair in the WanGP folder: inspect git status and follow launcher\\logs\\update.log before starting WanGP.");
+            }
+        }
+
+        bool SavePartialUpdateState(string pinnedSha, string oldHead, List<UpdateFile> files, HashSet<string> localFiles,
+            int failureCount, bool warningShown, string firstPath, DateTime retryAtUtc, out string error)
+        {
+            error = null;
+            if (!IsGitSha(pinnedSha) || !IsGitSha(oldHead) || files == null || localFiles == null)
+            {
+                error = "invalid recovery data";
+                return false;
+            }
+            var saved = new SavedPartialUpdate();
+            saved.Version = 1;
+            saved.PinnedSha = pinnedSha.ToLowerInvariant();
+            saved.OldHead = oldHead.ToLowerInvariant();
+            saved.FailureCount = Math.Max(0, failureCount);
+            saved.WarningShown = warningShown;
+            saved.FirstInUsePath = firstPath;
+            saved.RetryAtUtcTicks = retryAtUtc == DateTime.MinValue ? 0 : retryAtUtc.ToUniversalTime().Ticks;
+            saved.Files = new SavedUpdateFile[files.Count];
+            for (int i = 0; i < files.Count; i++)
+            {
+                UpdateFile file = files[i];
+                if (file == null || !IsSafeUpdatePath(file.Path) || "AMDT".IndexOf(file.Status) < 0)
+                {
+                    error = "invalid update path";
+                    return false;
+                }
+                saved.Files[i] = new SavedUpdateFile { Path = file.Path, Status = file.Status.ToString() };
+            }
+            var localPaths = new List<string>(localFiles);
+            for (int i = 0; i < localPaths.Count; i++)
+                if (!IsSafeUpdatePath(localPaths[i])) { error = "invalid local path"; return false; }
+            localPaths.Sort(StringComparer.OrdinalIgnoreCase);
+            saved.LocalFiles = localPaths.ToArray();
+            if (!String.IsNullOrEmpty(firstPath) && !IsSafeUpdatePath(firstPath)) { error = "invalid postponed path"; return false; }
+
+            string tempFile = Path.Combine(Path.GetDirectoryName(updatePartialFile), "update-partial-" + Guid.NewGuid().ToString("N") + ".tmp");
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(updatePartialFile));
+                var serializer = new JavaScriptSerializer();
+                serializer.MaxJsonLength = 4 * 1024 * 1024;
+                File.WriteAllText(tempFile, serializer.Serialize(saved), new UTF8Encoding(false));
+                if (File.Exists(updatePartialFile)) File.Replace(tempFile, updatePartialFile, null);
+                else File.Move(tempFile, updatePartialFile);
+                return true;
+            }
+            catch (Exception e)
+            {
+                error = e.Message;
+                return false;
+            }
+            finally
+            {
+                try { if (File.Exists(tempFile)) File.Delete(tempFile); } catch (Exception) { }
+            }
+        }
+
+        void DeletePartialUpdateState()
+        {
+            try { if (File.Exists(updatePartialFile)) File.Delete(updatePartialFile); }
+            catch (Exception e) { log.Commit("[update] Could not remove saved partial update state: " + e.Message); }
+        }
+
+        int RetryDelayMinutes(int attempt)
+        {
+            if (attempt >= 4) return (int)(UpdateRetryMaxDelayMs / 60000L);
+            if (attempt <= 1) return (int)(UpdateRetryBaseDelayMs / 60000L);
+            return (int)(UpdateRetryBaseDelayMs / 60000L) << (attempt - 1);
+        }
+
+        long RetryDelayMilliseconds(int attempt)
+        {
+            return Math.Min(UpdateRetryMaxDelayMs, RetryDelayMinutes(attempt) * 60000L);
+        }
+
+        bool TryCaptureUpdateFiles(out List<UpdateFile> files, out HashSet<string> localFiles, out string pinnedSha,
+            out string oldHead, out string error)
         {
             files = null;
             localFiles = null;
+            pinnedSha = null;
+            oldHead = null;
             error = null;
             string raw, toolError;
-            if (RunToolRaw("git", "diff --name-status --no-renames -z HEAD " + QuoteArgument("@{u}"), out raw, out toolError) != 0)
+            if (RunToolRaw("git", "rev-parse HEAD", out raw, out toolError) != 0 || !IsGitSha(raw.Trim()))
+            {
+                error = "could not read the current Git revision: " + toolError.Trim();
+                return false;
+            }
+            oldHead = raw.Trim();
+            if (RunToolRaw("git", "rev-parse " + QuoteArgument("@{u}"), out raw, out toolError) != 0 || !IsGitSha(raw.Trim()))
+            {
+                error = "could not pin the GitHub revision: " + toolError.Trim();
+                return false;
+            }
+            pinnedSha = raw.Trim();
+            if (RunToolRaw("git", "diff --name-status --no-renames -z " + QuoteArgument(oldHead) + " " + QuoteArgument(pinnedSha), out raw, out toolError) != 0)
             {
                 error = "could not list update files: " + toolError.Trim();
                 return false;
@@ -1266,7 +1592,7 @@ namespace WanGPLauncher
                 error = "git returned an invalid update file list; see launcher\\logs\\update.log.";
                 return false;
             }
-            if (RunToolRaw("git", "diff --name-only -z HEAD", out raw, out toolError) != 0)
+            if (RunToolRaw("git", "diff --name-only -z " + QuoteArgument(oldHead), out raw, out toolError) != 0)
             {
                 error = "could not list local changes: " + toolError.Trim();
                 return false;
@@ -1404,28 +1730,83 @@ namespace WanGPLauncher
             return false;
         }
 
-        List<string> FindInUseFiles(List<UpdateFile> files)
+        List<string> FindInUseFiles(List<UpdateFile> files, out string error)
         {
+            error = null;
             var inUse = new List<string>();
             foreach (UpdateFile file in files)
             {
                 string full;
-                if (!TryGetUpdateFullPath(file.Path, out full) || !File.Exists(full)) continue;
+                if (!TryGetUpdateFullPath(file.Path, out full)) continue;
+                FileAttributes attributes;
+                bool exists;
+                if (!TryReadUpdateAttributes(file.Path, full, out attributes, out exists, out error))
+                {
+                    log.Commit("[update] " + error);
+                    return inUse;
+                }
+                if (!exists) continue;
                 try
                 {
-                    if ((File.GetAttributes(full) & FileAttributes.ReadOnly) != 0) continue;
-                    using (var stream = new FileStream(full, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+                    bool readOnly = (attributes & FileAttributes.ReadOnly) != 0;
+                    using (var stream = new FileStream(full, FileMode.Open, readOnly ? FileAccess.Read : FileAccess.ReadWrite, FileShare.None)) { }
                 }
-                catch (IOException) { inUse.Add(file.Path); }
-                catch (UnauthorizedAccessException) { inUse.Add(file.Path); }
+                catch (UnauthorizedAccessException)
+                {
+                    error = "cannot write " + DisplayUpdatePath(file.Path) + ": access denied";
+                    log.Commit("[update] " + error);
+                    return inUse;
+                }
+                catch (IOException e)
+                {
+                    if (e.HResult == unchecked((int)0x80070020) || e.HResult == unchecked((int)0x80070021)) inUse.Add(file.Path);
+                    else if (e.HResult == unchecked((int)0x80070005))
+                    {
+                        error = "cannot write " + DisplayUpdatePath(file.Path) + ": access denied";
+                        log.Commit("[update] " + error);
+                        return inUse;
+                    }
+                    else
+                    {
+                        error = "could not check " + DisplayUpdatePath(file.Path) + ": " + e.Message;
+                        log.Commit("[update] " + error);
+                        return inUse;
+                    }
+                }
             }
             return inUse;
         }
 
-        string PostponedText(List<string> inUse)
+        bool TryReadUpdateAttributes(string path, string full, out FileAttributes attributes, out bool exists, out string error)
+        {
+            attributes = 0;
+            exists = false;
+            error = null;
+            try
+            {
+                attributes = File.GetAttributes(full);
+                exists = true;
+                return true;
+            }
+            catch (FileNotFoundException) { return true; }
+            catch (DirectoryNotFoundException) { return true; }
+            catch (UnauthorizedAccessException)
+            {
+                error = "cannot write " + DisplayUpdatePath(path) + ": access denied";
+                return false;
+            }
+            catch (IOException e)
+            {
+                error = "could not check " + DisplayUpdatePath(path) + ": " + e.Message;
+                return false;
+            }
+        }
+
+        string PostponedText(List<string> inUse, int attempt)
         {
             return "Postponed: " + inUse.Count + " file" + (inUse.Count == 1 ? "" : "s") +
-                " the update replaces are in use by another program (e.g. " + DisplayUpdatePath(inUse[0]) + "). Retrying in 15 minutes.";
+                " the update replaces are in use by another program (e.g. " + DisplayUpdatePath(inUse[0]) + "). Retrying in " +
+                RetryDelayMinutes(attempt) + " minutes.";
         }
 
         string DisplayUpdatePath(string path)
@@ -1444,25 +1825,84 @@ namespace WanGPLauncher
             string output;
             int result = RunTool("git", "rev-parse HEAD", false, out output);
             head = output.Trim();
-            error = result == 0 && head.Length > 0 ? null : "could not read the current Git revision: " + output.Trim();
+            error = result == 0 && IsGitSha(head) ? null : "could not read the current Git revision: " + output.Trim();
             return error == null;
         }
 
-        bool CompletePartialUpdate(List<UpdateFile> files, HashSet<string> localFiles, out string error)
+        bool CompletePartialUpdate(List<UpdateFile> files, HashSet<string> localFiles, string oldHead, string pinnedSha,
+            int failureCount, bool warningShown, string firstPath, out string error, out bool resetSucceeded, out bool abandoned)
         {
             error = null;
+            resetSucceeded = false;
+            abandoned = false;
             string output;
-            if (RunTool("git", "reset --mixed " + QuoteArgument("@{u}"), true, out output) != 0)
+            string currentHead, headError;
+            if (!ReadHead(out currentHead, out headError) || (currentHead != oldHead && currentHead != pinnedSha))
             {
-                log.Commit("[update] Could not reset the index to GitHub: " + output.Trim());
-                LogPartialRepair(localFiles, null, "git reset failed");
+                LogPartialRepair(localFiles, null, pinnedSha, headError == null ? "HEAD changed since the partial update" : headError);
+                abandoned = true;
                 error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
                 return false;
             }
 
-            var checkoutFiles = new List<string>();
+            if (RunTool("git", "merge-base --is-ancestor " + QuoteArgument(oldHead) + " " + QuoteArgument(pinnedSha), false, out output) != 0)
+            {
+                LogPartialRepair(localFiles, null, pinnedSha, "the pinned revision is not a descendant of the original HEAD");
+                abandoned = true;
+                error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
+                return false;
+            }
+
+            Dictionary<string, string> oldBlobs, pinnedBlobs;
+            if (!TryReadTreeBlobs(oldHead, out oldBlobs, out error) || !TryReadTreeBlobs(pinnedSha, out pinnedBlobs, out error))
+            {
+                if (error == null) error = "could not read the pinned update trees";
+                return false;
+            }
+
+            if (RunTool("git", "reset --mixed " + QuoteArgument(pinnedSha), true, out output) != 0)
+            {
+                log.Commit("[update] Could not reset the index to the pinned revision: " + output.Trim());
+                error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
+                return false;
+            }
+            resetSucceeded = true;
+
+            var candidateFiles = new List<string>();
             foreach (UpdateFile file in files)
-                if (file.Status != 'D' && !localFiles.Contains(file.Path)) checkoutFiles.Add(file.Path);
+                if (!localFiles.Contains(file.Path)) candidateFiles.Add(file.Path);
+            Dictionary<string, string> workingHashes;
+            if (!TryHashWorkingFiles(candidateFiles, out workingHashes, out error)) return false;
+
+            var checkoutFiles = new List<string>();
+            var deleteFiles = new List<string>();
+            foreach (UpdateFile file in files)
+            {
+                if (localFiles.Contains(file.Path)) continue;
+                string workingHash;
+                if (workingHashes.TryGetValue(file.Path, out workingHash))
+                {
+                    string oldBlob, pinnedBlob;
+                    bool matchesOld = oldBlobs.TryGetValue(file.Path, out oldBlob) && workingHash == oldBlob;
+                    bool matchesPinned = pinnedBlobs.TryGetValue(file.Path, out pinnedBlob) && workingHash == pinnedBlob;
+                    if (!matchesOld && !matchesPinned)
+                    {
+                        localFiles.Add(file.Path);
+                        log.Commit("[update] Skipped user-edited update path: " + DisplayUpdatePath(file.Path));
+                        continue;
+                    }
+                }
+                if (file.Status == 'D') deleteFiles.Add(file.Path);
+                else checkoutFiles.Add(file.Path);
+            }
+
+            string saveError;
+            if (!SavePartialUpdateState(pinnedSha, oldHead, files, localFiles, failureCount, warningShown,
+                firstPath, DateTime.MinValue, out saveError))
+            {
+                error = "Could not save update recovery state: " + saveError;
+                return false;
+            }
             if (checkoutFiles.Count > 0)
             {
                 string tempFile = Path.Combine(Path.GetTempPath(), "wangp-update-" + Guid.NewGuid().ToString("N") + ".paths");
@@ -1471,13 +1911,18 @@ namespace WanGPLauncher
                     var pathspecs = new StringBuilder();
                     foreach (string path in checkoutFiles) pathspecs.Append(":(literal)").Append(path).Append('\0');
                     File.WriteAllText(tempFile, pathspecs.ToString(), new UTF8Encoding(false));
-                    string args = "checkout " + QuoteArgument("@{u}") + " --pathspec-from-file=" + QuoteArgument(tempFile) + " --pathspec-file-nul";
+                    string args = "checkout " + QuoteArgument(pinnedSha) + " --pathspec-from-file=" + QuoteArgument(tempFile) + " --pathspec-file-nul";
                     if (RunTool("git", args, true, out output) != 0)
-                        log.Commit("[update] Could not check out all update files: " + output.Trim());
+                    {
+                        error = "Could not check out all update files: " + output.Trim();
+                        return false;
+                    }
                 }
                 catch (Exception e)
                 {
                     log.Commit("[update] Could not prepare the update path list: " + e.Message);
+                    error = "Could not prepare the update path list: " + e.Message;
+                    return false;
                 }
                 finally
                 {
@@ -1486,34 +1931,117 @@ namespace WanGPLauncher
                 }
             }
 
-            foreach (UpdateFile file in files)
+            foreach (string path in deleteFiles)
             {
-                if (file.Status != 'D' || localFiles.Contains(file.Path)) continue;
                 string full;
-                if (!TryGetUpdateFullPath(file.Path, out full))
+                if (!TryGetUpdateFullPath(path, out full))
                 {
-                    log.Commit("[update] Could not safely resolve deleted update path " + DisplayUpdatePath(file.Path) + ".");
-                    continue;
+                    error = "Could not safely resolve deleted update path " + DisplayUpdatePath(path) + ".";
+                    return false;
                 }
-                try { if (File.Exists(full)) File.Delete(full); }
-                catch (Exception e) { log.Commit("[update] Could not remove deleted update path " + DisplayUpdatePath(file.Path) + ": " + e.Message); }
+                FileAttributes attributes;
+                bool exists;
+                if (!TryReadUpdateAttributes(path, full, out attributes, out exists, out error)) return false;
+                if (exists && (attributes & FileAttributes.Directory) != 0)
+                {
+                    error = "Could not remove deleted update path " + DisplayUpdatePath(path) + ": the path is a directory.";
+                    return false;
+                }
+                try { if (exists) File.Delete(full); }
+                catch (Exception e)
+                {
+                    error = "Could not remove deleted update path " + DisplayUpdatePath(path) + ": " + e.Message;
+                    return false;
+                }
             }
 
-            string currentHead, upstreamHead, headError;
             bool headRead = ReadHead(out currentHead, out headError);
-            int upstreamResult = RunTool("git", "rev-parse " + QuoteArgument("@{u}"), false, out upstreamHead);
-            upstreamHead = upstreamHead.Trim();
             HashSet<string> leftovers;
             string diffError;
             bool diffRead = ReadLeftoverPaths(localFiles, out leftovers, out diffError);
-            bool verified = headRead && upstreamResult == 0 && currentHead == upstreamHead && diffRead && leftovers.Count == 0;
+            bool verified = headRead && currentHead == pinnedSha && diffRead && leftovers.Count == 0;
             if (!verified)
             {
-                string reason = !headRead ? headError : upstreamResult != 0 ? "could not read the upstream revision" :
-                    currentHead != upstreamHead ? "HEAD does not match the upstream revision" : !diffRead ? diffError : "update files remain different from HEAD";
-                LogPartialRepair(localFiles, diffRead ? leftovers : null, reason);
+                string reason = !headRead ? headError : currentHead != pinnedSha ? "HEAD does not match the pinned update revision" :
+                    !diffRead ? diffError : "update files remain different from HEAD";
+                LogPartialRepair(localFiles, diffRead ? leftovers : null, pinnedSha, reason);
                 error = "The update was only partly applied and could not be completed automatically. See launcher\\logs\\update.log.";
                 return false;
+            }
+            return true;
+        }
+
+        bool TryReadTreeBlobs(string revision, out Dictionary<string, string> blobs, out string error)
+        {
+            blobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            error = null;
+            string output, toolError;
+            if (RunToolRaw("git", "ls-tree -r -z --full-tree " + QuoteArgument(revision), out output, out toolError) != 0)
+            {
+                error = "could not read files at revision " + revision + ": " + toolError.Trim();
+                return false;
+            }
+            if (output.Length == 0) return true;
+            string[] entries = output.Split(new char[] { '\0' });
+            int length = entries.Length;
+            if (length > 0 && entries[length - 1].Length == 0) length--;
+            for (int i = 0; i < length; i++)
+            {
+                int tab = entries[i].IndexOf('\t');
+                if (tab < 0) { error = "git returned an invalid tree entry"; return false; }
+                string[] metadata = entries[i].Substring(0, tab).Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                string path = entries[i].Substring(tab + 1);
+                if (metadata.Length != 3 || !IsGitSha(metadata[2]) || !IsSafeUpdatePath(path))
+                {
+                    error = "git returned an unsafe tree entry";
+                    return false;
+                }
+                if (metadata[1] == "blob") blobs[path] = metadata[2].ToLowerInvariant();
+            }
+            return true;
+        }
+
+        bool TryHashWorkingFiles(List<string> paths, out Dictionary<string, string> hashes, out string error)
+        {
+            hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            error = null;
+            var existing = new List<string>();
+            var input = new StringBuilder();
+            foreach (string path in paths)
+            {
+                if (!IsSafeUpdatePath(path)) { error = "git returned an unsafe update path"; return false; }
+                string full;
+                if (!TryGetUpdateFullPath(path, out full)) { error = "could not safely resolve update path " + DisplayUpdatePath(path); return false; }
+                FileAttributes attributes;
+                bool exists;
+                if (!TryReadUpdateAttributes(path, full, out attributes, out exists, out error)) return false;
+                if (!exists) continue;
+                if ((attributes & FileAttributes.Directory) != 0)
+                {
+                    error = "could not hash " + DisplayUpdatePath(path) + ": the path is a directory";
+                    return false;
+                }
+                existing.Add(path);
+                input.Append(path).Append('\n');
+            }
+            if (existing.Count == 0) return true;
+            string output, toolError;
+            if (RunToolRawWithInput("git", "hash-object --stdin-paths", input.ToString(), out output, out toolError) != 0)
+            {
+                error = "could not hash working update files: " + toolError.Trim();
+                return false;
+            }
+            string[] hashesByPath = output.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            if (hashesByPath.Length != existing.Count)
+            {
+                error = "git returned an invalid working-file hash list";
+                return false;
+            }
+            for (int i = 0; i < existing.Count; i++)
+            {
+                string hash = hashesByPath[i].Trim();
+                if (!IsGitSha(hash)) { error = "git returned an invalid working-file hash"; return false; }
+                hashes[existing[i]] = hash.ToLowerInvariant();
             }
             return true;
         }
@@ -1539,7 +2067,7 @@ namespace WanGPLauncher
             return true;
         }
 
-        void LogPartialRepair(HashSet<string> localFiles, HashSet<string> leftovers, string reason)
+        void LogPartialRepair(HashSet<string> localFiles, HashSet<string> leftovers, string pinnedSha, string reason)
         {
             log.Commit("[update] Automatic completion could not verify the update: " + reason + ".");
             if (leftovers == null)
@@ -1561,7 +2089,8 @@ namespace WanGPLauncher
                 if (leftovers.Count > 20) log.Commit("[update] " + (leftovers.Count - 20) + " more leftover path(s) not shown.");
             }
             log.Commit("[update] Manual repair in the WanGP folder:");
-            log.Commit("[update]   git reset --mixed \"@{u}\"");
+            string revision = IsGitSha(pinnedSha) ? pinnedSha : "<pinned-sha>";
+            log.Commit("[update]   git reset --mixed \"" + revision + "\"");
             if (leftovers != null && leftovers.Count > 0)
             {
                 int shown = 0;
@@ -1569,10 +2098,10 @@ namespace WanGPLauncher
                 {
                     if (shown++ == 20) break;
                     string literalPath = ":(literal)" + path;
-                    log.Commit("[update]   git checkout \"@{u}\" -- " + PowerShellQuote(literalPath));
+                    log.Commit("[update]   git checkout \"" + revision + "\" -- " + PowerShellQuote(literalPath));
                 }
             }
-            else log.Commit("[update]   For each leftover path, run git checkout \"@{u}\" -- '<path>'.");
+            else log.Commit("[update]   For each leftover path, run git checkout \"" + revision + "\" -- '<path>'.");
         }
 
         string PowerShellQuote(string value)
@@ -1580,21 +2109,98 @@ namespace WanGPLauncher
             return "'" + value.Replace("'", "''") + "'";
         }
 
-        void FinishPostponedUpdate(string message, bool partial, List<UpdateFile> files, HashSet<string> localFiles, bool manualAttempt)
+        void FinishPostponedUpdate(string message, bool partial, List<UpdateFile> files, HashSet<string> localFiles,
+            string pinnedSha, string oldHead, string postponedPath, bool manualAttempt)
         {
             updating = false;
             updateReady = true;
-            updateRetryAt = Now + UpdateRetryDelayMs;
+            updateFailureCount = Math.Min(100000, updateFailureCount + 1);
+            long delay = RetryDelayMilliseconds(updateFailureCount);
+            updateRetryAt = Now + delay;
+            if (String.IsNullOrEmpty(firstInUsePath) && !String.IsNullOrEmpty(postponedPath)) firstInUsePath = postponedPath;
             updatePartial = partial;
             partialUpdateFiles = partial ? new List<UpdateFile>(files) : null;
             partialLocalFiles = partial ? new HashSet<string>(localFiles, StringComparer.OrdinalIgnoreCase) : null;
+            partialPinnedSha = partial ? pinnedSha : null;
+            partialOldHead = partial ? oldHead : null;
             lastUpdateCheckAt = Now;
             Mode m = forceMcp ? Mode.Mcp : afterUpdate;
-            afterUpdate = Mode.None;
+            if (!partial) afterUpdate = Mode.None;
             SetState(State.Stopped);
-            if (manualAttempt) ShowBalloon("WanGP update postponed", message, ToolTipIcon.Warning, ShowLog);
+            manualUpdate = false;
+            if (partial)
+            {
+                string saveError;
+                if (!SavePartialUpdateState(pinnedSha, oldHead, files, localFiles, updateFailureCount,
+                    updateRetryWarningShown, firstInUsePath, DateTime.UtcNow.AddMilliseconds(delay), out saveError))
+                {
+                    updateRepairRequired = true;
+                    log.Commit("[update] Could not persist partial update retry state: " + saveError);
+                }
+            }
+            if (manualAttempt && updateFailureCount == 1) ShowBalloon("WanGP update postponed", message, ToolTipIcon.Warning, ShowLog);
+            if (updateFailureCount >= 4 && !updateRetryWarningShown && !String.IsNullOrEmpty(firstInUsePath))
+            {
+                updateRetryWarningShown = true;
+                ShowBalloon("WanGP update keeps being postponed:", DisplayUpdatePath(firstInUsePath) + " is in use. Click for the log.",
+                    ToolTipIcon.Warning, ShowLog);
+                if (partial)
+                {
+                    string saveError;
+                    if (!SavePartialUpdateState(pinnedSha, oldHead, files, localFiles, updateFailureCount,
+                        updateRetryWarningShown, firstInUsePath, DateTime.UtcNow.AddMilliseconds(delay), out saveError))
+                        log.Commit("[update] Could not save the retry warning state: " + saveError);
+                }
+            }
             // A half-updated WanGP would only crash or hold the files open again, so wait for the retry instead.
             if (!exiting && !partial && m != Mode.None) Start(m, false);
+        }
+
+        void FinishPartialUpdateFailure(string error, List<UpdateFile> files, HashSet<string> localFiles,
+            string pinnedSha, string oldHead, string postponedPath)
+        {
+            updating = false;
+            manualUpdate = false;
+            updateReady = false;
+            updatePartial = true;
+            updateRetryAt = 0;
+            partialUpdateFiles = files == null ? null : new List<UpdateFile>(files);
+            partialLocalFiles = localFiles == null ? null : new HashSet<string>(localFiles, StringComparer.OrdinalIgnoreCase);
+            partialPinnedSha = pinnedSha;
+            partialOldHead = oldHead;
+            if (String.IsNullOrEmpty(firstInUsePath)) firstInUsePath = postponedPath;
+            lastUpdateCheckAt = Now;
+            string saveError;
+            if (!SavePartialUpdateState(partialPinnedSha, partialOldHead, partialUpdateFiles, partialLocalFiles,
+                updateFailureCount, updateRetryWarningShown, firstInUsePath, DateTime.MinValue, out saveError))
+            {
+                updateRepairRequired = true;
+                log.Commit("[update] Could not persist partial update state: " + saveError);
+            }
+            log.Commit("[update] " + error);
+            ShowBalloon("WanGP update failed", error + ". WanGP remains stopped because the update is partial. Click for the log.",
+                ToolTipIcon.Warning, ShowLog);
+            SetState(State.Stopped);
+        }
+
+        void FinishAbandonedPartialUpdate(string error)
+        {
+            updating = false;
+            manualUpdate = false;
+            updateReady = false;
+            updatePartial = false;
+            updateRetryAt = 0;
+            partialUpdateFiles = null;
+            partialLocalFiles = null;
+            partialPinnedSha = null;
+            partialOldHead = null;
+            afterUpdate = Mode.None;
+            updateRepairRequired = true;
+            DeletePartialUpdateState();
+            if (String.IsNullOrEmpty(error)) error = "The partial update needs manual repair. See launcher\\logs\\update.log.";
+            log.Commit("[update] " + error);
+            ShowBalloon("WanGP update needs manual repair", "WanGP remains stopped. Click for the log.", ToolTipIcon.Error, ShowLog);
+            SetState(State.Stopped);
         }
 
         string QuoteArgument(string value)
@@ -1663,6 +2269,51 @@ namespace WanGPLauncher
             }
         }
 
+        int RunToolRawWithInput(string exe, string args, string input, out string output, out string errorOutput)
+        {
+            output = "";
+            errorOutput = "";
+            var psi = new ProcessStartInfo(exe, args);
+            psi.WorkingDirectory = root;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardInput = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.StandardOutputEncoding = new UTF8Encoding(false);
+            psi.StandardErrorEncoding = new UTF8Encoding(false);
+            psi.EnvironmentVariables["GIT_TERMINAL_PROMPT"] = "0";
+            psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+            try
+            {
+                using (var p = new Process())
+                {
+                    p.StartInfo = psi;
+                    p.Start();
+                    string rawOutput = "", rawError = "";
+                    var stdout = new Thread(delegate () { rawOutput = p.StandardOutput.ReadToEnd(); });
+                    var stderr = new Thread(delegate () { rawError = p.StandardError.ReadToEnd(); });
+                    stdout.IsBackground = true;
+                    stderr.IsBackground = true;
+                    stdout.Start();
+                    stderr.Start();
+                    try { p.StandardInput.Write(input); }
+                    finally { p.StandardInput.Close(); }
+                    p.WaitForExit();
+                    stdout.Join();
+                    stderr.Join();
+                    output = rawOutput;
+                    errorOutput = rawError;
+                    return p.ExitCode;
+                }
+            }
+            catch (Exception e)
+            {
+                errorOutput = e.Message;
+                return -1;
+            }
+        }
+
         void FinishUpdate(string error, string summary)
         {
             updating = false;
@@ -1670,7 +2321,13 @@ namespace WanGPLauncher
             updatePartial = false;
             partialUpdateFiles = null;
             partialLocalFiles = null;
+            partialPinnedSha = null;
+            partialOldHead = null;
             updateRetryAt = 0;
+            updateFailureCount = 0;
+            updateRetryWarningShown = false;
+            firstInUsePath = null;
+            DeletePartialUpdateState();
             lastUpdateCheckAt = Now;
             if (error != null)
             {
